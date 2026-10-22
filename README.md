@@ -17,6 +17,7 @@ to validate.
 - Design: [docs/design.md](docs/design.md) (owner draft v0.2, fact-checked)
 - Phase 0 plan: [docs/phase-0.md](docs/phase-0.md)
 - Shared build cache over Tailscale (plan): [docs/tailscale-shared-cache.md](docs/tailscale-shared-cache.md)
+- Layer 3 scheduler plan: [docs/layer-3-scheduler.md](docs/layer-3-scheduler.md)
 
 ## The two-lane principle
 
@@ -63,7 +64,7 @@ validate, not claims.
 | [`docs/`](docs/) | The design, the Phase 0 plan, and benchmark reports |
 | [`bench/`](bench/) | Benchmark corpus definition and harness (scripts, result summaries) |
 | [`driver/`](driver/) | Rust: `rustc_driver` shim and codegen plug-in |
-| [`qrcd/`](qrcd/) | Zig or Rust: orchestrator daemon and cache client |
+| [`qrcd/`](qrcd/) | Rust: orchestrator daemon and cache client (plan: [docs/layer-3-scheduler.md](docs/layer-3-scheduler.md)) |
 | [`backend/`](backend/) | Optional: single-pass code emitter |
 | [`tests/`](tests/) | Differential and determinism test suites |
 

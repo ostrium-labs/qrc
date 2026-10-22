@@ -110,6 +110,9 @@ Goal: a cold CI runner downloads prebuilt artifacts instead of compiling. Use an
 
 ## 6. Layer 3: orchestrator daemon `qrcd` (weeks to months)
 
+The detailed plan is in [layer-3-scheduler.md](layer-3-scheduler.md). The owner decision is Rust only,
+adopting the scheduling designs of Cargo's `JobQueue`, Samurai/Ninja, Buck2, and QRC's simulator.
+
 - Consumes cargo's unit graph (`cargo build --unit-graph`, a nightly flag) and schedules units itself.
 - **Cache-aware scheduling:** query the cache for hits before spawning rustc, so cached units never occupy a job slot. Wrapper-only caches cannot do this.
 - **Pipelining:** start dependents as soon as `.rmeta` exists, not when the full `.rlib` finishes.
