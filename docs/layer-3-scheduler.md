@@ -1,172 +1,138 @@
-# Layer 3: qrcd debug scheduler
+# Layer 3: qrcd Orchestrator & Build Engine (Buck2 Fork + TypeScript + Tailscale)
 
-**Status:** plan, written 2026-10-23. Nothing here is built or measured yet.  
-**Owner decision:** `qrcd` is written in **Rust only**. Zig and Goose are rejected. The scheduler adopts and adapts proven designs from Cargo's `JobQueue`, Samurai/Ninja, Meta's Buck2, and QRC's own simulator.
-
-This is the design plan for Layer 3 of the [design](design.md) (section 6, "Layer 3: orchestrator daemon `qrcd`"). It defines the architecture, language choice, scheduling algorithms, and reference repositories we will adapt to eliminate scheduling gaps in Rust debug builds.
+**Status:** plan, updated 2026-10-23.  
+**Owner decision:** `qrc` will fork and adapt **Meta's Buck2** in **Rust**, expanding from a Rust-specific compiler accelerator into an ultra-fast monorepo orchestrator (combining **Nx**-style developer ergonomics with Buck2's hermetic execution engine). It introduces native **TypeScript** support powered by the latest **Bun**, fast Rust-based TS toolchains (`tsrc` / `tsrs`), and seamless remote cache synchronization over **Tailscale** private object stores.
 
 ---
 
-## 1. Goal & Evidence
+## 1. Goal & Strategic Vision
 
-The Phase 0 baseline measurements demonstrate that scheduling inefficiencies represent one of the single largest bottlenecks in cold and incremental builds:
+`qrc` began by targeting Rust debug compilation bottlenecks (where Phase 0 showed **45% to 72% of CPU time lost to scheduling gaps** on Nushell and Ripgrep).
 
-- **Nushell (`baseline-stable`, 14 cores):** 45% of slot-seconds in cold builds and 21% in cold tests are lost to **scheduling gaps (`idle` slots)**.
-- **Ripgrep (`baseline-stable`, 14 cores):** 72% of slot-seconds in cold builds are lost to idle slots.
+However, modern systems codebases (including Ostrium Labs' ecosystem with `loams`, `loams-mastra`, `client-rust`, and API services) are polyglot monorepos combining **Rust** backends and **TypeScript** frontend/AI agent services.
 
-While Cargo compiles individual crates with multi-threading, Cargo's coarse-grained ready queue and lack of global critical-path prioritization leaves CPU slots severely underutilized while waiting on bottleneck crates (such as `nu-protocol` or `loams-meta`).
-
-`qrcd` aims to maximize parallel CPU saturation and minimize wall time for debug builds by:
-1. Prioritizing the build's critical path (longest downstream chain first).
-2. Pipelining `.rmeta` metadata emissions to unblock dependents early.
-3. Bypassing jobserver execution slots for cache hits.
-4. Keeping graph and change-detection state warm in a persistent daemon.
+We are evolving `qrc` into a modern, unified build orchestrator:
+1. **The Core Engine:** A specialized fork of **Buck2** (written in Rust) providing incremental graph computation (Dice) and fine-grained action pipelining.
+2. **First-Class TypeScript Support:** High-performance TS execution, bundling, and testing powered by **Bun** and Rust-native tooling (`tsrc`, `tsrs`, SWC/OXC).
+3. **Monorepo Ergonomics (Nx-style):** Automatic workspace dependency graphs, affected task computation, task caching, and simple CLI commands (`qrc run`, `qrc affected`, `qrc test`).
+4. **Tailscale & Bucket Cache Integration:** Built-in remote cache streaming to S3-compatible bucket stores (RustFS) over private Tailscale WireGuard networks without public ingress.
 
 ---
 
-## 2. Language Choice: Rust vs. Zig vs. Goose
+## 2. Core Engine: Forking Meta's Buck2 in Rust
 
-Earlier roadmap drafts considered Zig or Rust for `qrcd`. We evaluated three candidate systems languages: **Rust**, **Zig**, and **Goose** ([`aardappel/goose`](https://github.com/aardappel/goose)).
+Rather than building a new scheduler and action executor from scratch, `qrcd` will fork and tailor **Meta's Buck2** ([`facebook/buck2`](https://github.com/facebook/buck2)).
 
-### 2.1 Goose (`aardappel/goose`) — Rejected
+### 2.1 Language Decision: Rust vs. Zig vs. Goose
+We evaluated three candidate systems languages for the orchestrator engine: **Rust**, **Zig**, and **Goose** ([`aardappel/goose`](https://github.com/aardappel/goose)).
 
-Goose (by Wouter van Oortmerssen) is an experimental systems programming language featuring no garbage collection, no lifetime annotations, and **no dynamic heap allocation**.
+- **Goose (`aardappel/goose`) — Rejected:** Goose features no dynamic heap allocation, which is fundamentally incompatible with dynamic dependency graphs consisting of thousands of arbitrary nodes (e.g., `nushell`, `loams`, `zed`). It also lacks production POSIX IPC, jobserver protocols, and file-watching libraries, with no viable path to upstream contributions in `rust-lang`.
+- **Zig — Rejected:** Severe FFI impedance when interfacing with Cargo and rustc internals, inability to leverage Rust crates (`jobserver`, `notify`), and zero possibility of upstream adoption into Cargo.
+- **Rust — Selected:** Zero FFI overhead, sub-microsecond scheduling in release mode, direct crate reuse (`jobserver`, `tokio`, `notify`), and full compatibility with Buck2's codebase and `rust-lang`.
 
-- **Incompatible with dynamic build graphs:** `qrcd` consumes Cargo's `--unit-graph`, which consists of thousands of dynamic nodes and edges (e.g., 1,263 units in `nushell`, 1,410 packages in `loams`). A language without dynamic heap allocation cannot naturally construct arbitrary DAGs, resize priority queues, or manage dynamic network/IPC buffers without huge static buffers.
-- **No systems ecosystem:** `qrcd` requires JSON parsing, POSIX IPC (Unix domain sockets/named pipes), jobserver token passing via pipes, and OS file notifications (`inotify`/`kqueue`). Goose lacks production libraries for all of these.
-- **No upstream path:** `qrc` is dual-licensed MIT OR Apache-2.0 specifically to upstream innovations into `rust-lang/cargo`. The Rust project will never accept a dependency on Goose.
+### 2.2 Why Buck2 as the Foundation?
+- **Written 100% in Rust:** Matches our owner decision to use Rust exclusively. Zero FFI overhead, high concurrency, and direct integration with Rust's toolchain.
+- **The Dice Computation Engine:** Buck2's incremental computation framework tracks dependencies at fine granularity, re-evaluating only invalidated graph slices.
+- **Hermetic & Remote Execution API (REAPI):** Native understanding of action inputs/outputs, content-addressed storage (CAS), and remote execution caches.
+- **Extensible Rule System:** Rules are defined in Starlark, making it straightforward to add specialized Rust rules (`qrc_rust_library`, `qrc_rust_binary`) and TypeScript rules (`bun_package`, `ts_library`).
 
-### 2.2 Zig — Rejected
-
-- **FFI impedance with Cargo:** `qrcd` must parse Cargo's unit graph, talk rustc's IPC protocol, and interact with Cargo's jobserver. In Zig, all Rust data structures and protocols must be re-implemented from scratch or interfaced via fragile C FFI.
-- **No upstream adoption:** The Rust project will not accept a Zig orchestrator upstream into `cargo`.
-- **False optimization:** While Zig offers fast self-compilation, `qrcd` runs as a long-lived background daemon. Its own compilation is a one-time event that has zero impact on user Rust debug build times.
-
-### 2.3 Rust — Selected (Owner Decision)
-
-- **Zero FFI & direct crate reuse:** Can directly use or adapt Cargo's own battle-tested [`jobserver`](https://crates.io/crates/jobserver) crate, `serde_json` for `--unit-graph`, and `notify` for cross-platform filesystem events.
-- **Peak runtime performance:** Compiled in release mode, a Rust scheduler incurs sub-microsecond decision overhead per task with zero GC pauses.
-- **Direct upstream path:** Any improvements to critical-path scheduling and pipelining can be directly contributed upstream to `rust-lang/cargo`.
-
-**Decision:** `qrcd` is 100% Rust.
+### What We Strip & Tailor in the Fork:
+- Remove Meta-internal infrastructure dependencies and bloated toolchains.
+- Introduce zero-config auto-discovery for `Cargo.toml` and `package.json` workspaces so users do not have to write verbose `BUCK` files manually.
+- Integrate QRC's Phase 0 critical-path priority weighting directly into the Buck2 action execution loop (`app/buck2_execute`).
 
 ---
 
-## 3. Mechanisms for Maximum Compile-Time Reduction
+## 3. TypeScript Integration: Bun, `tsrc`, and `tsrs`
 
-### 3.1 Critical-Path-First Scheduling (Longest Remaining Path First)
+TypeScript builds in traditional monorepos suffer from slow `tsc` type-checking, heavy Node.js startup latency, and disjoint package managers. `qrc` unifies TypeScript workflows natively:
 
-Cargo's internal ready queue launches unblocked units in a largely FIFO or topological order. When a core bottleneck crate sits at the end of the ready list, cores finish other leaves quickly and then starve waiting for the bottleneck.
+### 3.1 Bun Runtime & Package Manager
+- **Runtime & Test Runner:** Use the latest **Bun** ([`bun.sh`](https://bun.sh)) for lightning-fast test execution (`bun test`), script execution, and bundling.
+- **Workspace Dependency Resolution:** Native lockfile ingestion (`bun.lock`) with instant symlinking of monorepo packages.
 
-`qrcd` dynamically weights every node $u$ in the build DAG by its longest remaining downstream latency to build completion:
-
-$$Weight(u) = Duration(u) + \max_{v \in Dependents(u)} Weight(v)$$
-
-When jobserver tokens become available, the scheduler always pops the node with the highest remaining weight from a `BinaryHeap` priority queue.
-
-### 3.2 Aggressive `.rmeta` Pipelining
-
-Downstream compilation requires only type signatures and metadata (`.rmeta`) from dependencies, not executable object code or full `.rlib` archives.
-
-`qrcd` splits each unit's execution into two phases:
-1. **Front-end (`.rmeta` generation):** Upon `.rmeta` readiness, downstream dependent units are immediately promoted to the ready queue.
-2. **Back-end (codegen and archive):** Continues in the background to produce the final `.rlib`.
-
-### 3.3 Cache-Aware Slot Allocation
-
-Standard wrapper caches (like `sccache`) intercept rustc invocations *after* Cargo has already acquired a jobserver token. A cache hit consumes a worker slot while downloading or restoring artifacts.
-
-`qrcd` queries the cache (Layer 2 local and Tailscale shared store) **before** claiming a jobserver token. Cache hits restore artifacts asynchronously in lightweight I/O tasks without burning jobserver CPU slots, leaving all compile tokens dedicated to real compiler jobs.
-
-### 3.4 Memory-Aware Concurrency Throttling
-
-Heavy workspaces (e.g. `loams` and `zed`) spike memory usage when multiple large crates codegen in parallel (e.g. `loams` requires throttling to `-j 4` on 16 GB machines). `qrcd` uses historical peak RSS metrics from Phase 0 to limit concurrent execution of memory-heavy units, preventing swap thrashing and OOM kills.
+### 3.2 Rust-Native TypeScript Tooling (`tsrc` / `tsrs`)
+- **Fast Transpilation (`tsrc`):** Integrate Rust-based TypeScript transpilation (via SWC or OXC engines) for sub-millisecond per-file compilation in debug lane workflows.
+- **Cross-Language Type Synthesis (`tsrs`):** Integrate `ts-rs` / Rust-TS reflection shims to automatically generate TypeScript interface definitions directly from Rust structs and enums across workspace boundaries, ensuring compile-time contract safety between Rust services and TypeScript clients.
+- **Declaration Pipelining (`.d.ts` Pipelining):** Analogous to Rust's `.rmeta` pipelining, downstream TypeScript libraries begin building as soon as upstream `.d.ts` declaration files are emitted, without waiting for JavaScript bundling.
 
 ---
 
-## 4. Repositories to Adopt and Adapt
+## 4. Monorepo Experience: Nx Ergonomics + Tailscale Caching
 
-Rather than designing from scratch, `qrcd` adapts proven scheduling and process-management patterns from four primary references:
-
-### 4.1 QRC Simulator (`bench/simulate.py` & `bench/critical_path.py`)
-- **Reference:** Ostrium Labs PR [#10](https://github.com/ostrium-labs/qrc/pull/10) and PR [#12](https://github.com/ostrium-labs/qrc/pull/12).
-- **What to adapt:**
-  - The DAG inversion and path calculation algorithm.
-  - The separation between full edges (`unblocked_units`) and metadata edges (`unblocked_rmeta_units`).
-  - Cache-aware slot bypass modeling.
-
-### 4.2 Cargo's `JobQueue` (`rust-lang/cargo`)
-- **Reference:** [`src/cargo/core/compiler/job_queue/mod.rs`](https://github.com/rust-lang/cargo/blob/master/src/cargo/core/compiler/job_queue/mod.rs) and `job.rs`.
-- **What to adapt:**
-  - Token acquisition and return using the `jobserver` crate.
-  - IPC protocol reading `--json=artifacts` messages from rustc over stdout pipes.
-  - Signal handling, process group management, and clean interruption (`Ctrl-C`).
-  - Replace Cargo's ready deque with a critical-path priority queue.
-
-### 4.3 Samurai / Ninja (`michaelforney/samurai` & `ninja-build/ninja`)
-- **Reference:** [`michaelforney/samurai`](https://github.com/michaelforney/samurai) (`build.c`) and [`ninja-build/ninja`](https://github.com/ninja-build/ninja) (`src/build.cc`).
-- **What to adapt:**
-  - The gold standard for minimal-overhead DAG scheduling:
-    - Pre-computed topological depth weighting.
-    - Zero-allocation ready queue transitions upon task completion.
-    - Sub-millisecond cycle detection and dependency resolution.
-
-### 4.4 Meta's Buck2 Execution Engine (`facebook/buck2`)
-- **Reference:** [`app/buck2_execute`](https://github.com/facebook/buck2/tree/main/app/buck2_execute) and [`app/buck2_build_api`](https://github.com/facebook/buck2/tree/main/app/buck2_build_api).
-- **What to adapt:**
-  - Modern Rust async action orchestration.
-  - Integration of remote cache lookups into the dependency state machine.
-  - Memory-pressure tracking and load-shedding mechanisms.
-
----
-
-## 5. Architecture & Component Layout
+`qrc` provides the developer experience of **Nx** with the speed of **Buck2** and the zero-trust security of **Tailscale**.
 
 ```
-                  ┌───────────────────────────────┐
-                  │    qrc CLI (Frontend / Shim)  │
-                  └──────────────┬────────────────┘
-                                 │ Unix Domain Socket
-                                 ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ qrcd (Daemon)                                                   │
-│                                                                 │
-│  ┌───────────────────────┐         ┌─────────────────────────┐  │
-│  │  Cargo Unit Graph     │         │   Cache Engine          │  │
-│  │  Parser (--unit-graph)│         │   (sccache / Tailscale) │  │
-│  └───────────┬───────────┘         └────────────┬────────────┘  │
-│              │                                  │ Hit / Miss    │
-│              ▼                                  │ Query         │
-│  ┌──────────────────────────────────────────────▼────────────┐  │
-│  │  Critical Path DAG Planner (Ninja/Samurai style)          │  │
-│  │  - Static & historical duration weighting                 │  │
-│  │  - Dynamic remaining-path BinaryHeap                      │  │
-│  └───────────────────────────┬───────────────────────────────┘  │
-│                              │                                  │
-│                              ▼                                  │
-│  ┌───────────────────────────────────────────────────────────┐  │
-│  │  Job Execution Engine (Cargo JobQueue style)              │  │
-│  │  - GNU Make jobserver client                              │  │
-│  │  - Async process runner & signal handler                  │  │
-│  │  - .rmeta pipe listener -> triggers dependent unblocking  │  │
-│  └───────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────┐
+│                        Developer / CI Environment                      │
+│                                                                        │
+│  CLI:  qrc build //...  │  qrc affected --target=test  │  qrc dev      │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│ qrcd Orchestrator (Buck2 Core in Rust)                                 │
+│                                                                        │
+│  ┌────────────────────────┐              ┌──────────────────────────┐  │
+│  │ Rust Workspaces        │              │ TypeScript Workspaces    │  │
+│  │ (Cargo Unit Graph)     │              │ (Bun / package.json)     │  │
+│  └───────────┬────────────┘              └─────────────┬────────────┘  │
+│              │                                         │               │
+│              ▼                                         ▼               │
+│  ┌──────────────────────────────────────────────────────────────────┐  │
+│  │ Dice Incremental Graph & Critical-Path Scheduler (PR #10 / #12)  │  │
+│  │ - Rust .rmeta pipelining                                         │  │
+│  │ - TypeScript .d.ts pipelining                                    │  │
+│  └──────────────────────────────────┬───────────────────────────────┘  │
+└─────────────────────────────────────┼──────────────────────────────────┘
+                                      │ Encrypted WireGuard
+                                      ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│ Remote Cache Store (S3-Compatible Object Storage over Tailscale)       │
+│                                                                        │
+│  - Storage Backend: RustFS / SeaweedFS (Port 9000)                     │
+│  - Network: tag:build-cache on Tailnet                                 │
+│  - Cache Hits: Restored asynchronously without burning jobserver slots │
+└────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 5.1 Crate Layout inside `qrc`
-- `driver/`: `rustc_driver` shim to report `.rmeta` availability and timing.
-- `qrcd/`: The daemon binary and library crates:
-  - `qrcd-core`: DAG definitions, critical path weighting, priority queue.
-  - `qrcd-jobserver`: Token passing and process slot manager.
-  - `qrcd-cache`: Local and remote cache lookup client.
-  - `qrcd-ipc`: Protocol between `qrc` CLI and `qrcd` daemon.
+### 4.1 Affected Task Graph & Incremental Runs
+- Changes to Git commits or working tree files automatically identify the minimal subgraph of affected Rust crates and TypeScript packages (like `nx affected`).
+- Unaffected build targets and tests are restored instantly from cache.
+
+### 4.2 S3 Bucket & Tailscale Private Cache
+- Implements the [Tailscale shared build cache](tailscale-shared-cache.md) plan.
+- Buck2's remote cache backend is wired directly to an S3-compatible store (RustFS) listening on private Tailscale IP addresses.
+- **Zero-Slot Cache Hits:** When an action hash matches in the cache, the artifact is fetched and unpacked out-of-band without acquiring a jobserver concurrency token, keeping all CPU cores free for active compilations.
+
+---
+
+## 5. Architectural Comparison: Prior Art & Lineage
+
+| Capability | Stock Cargo | Nx | Turborepo | **qrc (Buck2 Fork)** |
+|---|---|---|---|---|
+| **Language** | Rust | TypeScript | Go / Rust | **Rust** |
+| **Execution Engine** | JobQueue FIFO | Node.js Task Runner | Basic DAG | **Buck2 Dice Engine (Hermetic)** |
+| **Rust Pipelining** | Limited `.rmeta` | None | None | **Aggressive `.rmeta` Critical Path** |
+| **TS Engine** | N/A | `tsc` / esbuild | `tsc` / esbuild | **Bun + `tsrc`/`tsrs` + `.d.ts` Pipelining** |
+| **Cache Transport** | Local only | Nx Cloud (HTTP) | Vercel Remote Cache | **S3 / RustFS over Tailscale Mesh** |
+| **Job Allocation** | Burns slot on hit | N/A | Process slots | **Cache-aware slot bypass** |
 
 ---
 
 ## 6. Implementation Milestones
 
-1. **Milestone 1 (Graph & Planner):** Port `bench/simulate.py`'s critical-path calculation into a Rust crate (`qrcd-core`) consuming `cargo build --unit-graph --json`.
-2. **Milestone 2 (Job Engine):** Adapt Cargo's `JobQueue` and `jobserver` token manager into a standalone Rust executor.
-3. **Milestone 3 (Pipelining):** Implement the `.rmeta` listener to unblock downstream units before codegen completion.
-4. **Milestone 4 (Cache Integration):** Hook into the Layer 2 cache client to bypass job slots on hits.
-5. **Milestone 5 (Daemon & Benchmarking):** Package into `qrcd` with warm in-memory state and measure wall-time reductions against the Phase 0 baselines.
+1. **Milestone 1 (Buck2 Core Fork):**
+   - Fork [`facebook/buck2`](https://github.com/facebook/buck2) into `crates/qrc-core` / `qrcd`.
+   - Strip internal Meta shims and enable standalone Rust build.
+2. **Milestone 2 (Cargo & Rust Adaptor):**
+   - Integrate auto-generation of Buck2 actions from `cargo --unit-graph`.
+   - Incorporate critical-path priority weighting derived from `bench/critical_path.py` (PR #10) and `bench/simulate.py` (PR #12).
+3. **Milestone 3 (Bun & TypeScript Integration):**
+   - Implement `bun_package` and `ts_library` rules.
+   - Wire `tsrc` / OXC for sub-millisecond transpilation and `tsrs` for Rust-TypeScript type sharing.
+   - Enable `.d.ts` pipelining to unblock dependent TypeScript packages early.
+4. **Milestone 4 (Tailscale S3 Cache Provider):**
+   - Connect Buck2's CAS / HTTP caching client to S3-compatible endpoints over Tailscale (`tag:build-cache`).
+5. **Milestone 5 (Nx-Style Developer CLI):**
+   - Deliver `qrc build`, `qrc test`, `qrc affected`, and `qrc run` CLI commands with zero-config workspace detection.
