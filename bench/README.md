@@ -124,6 +124,25 @@ the report embeds those charts by links relative to the report file (for instanc
 checks it against [`tests/fixture.jsonl`](tests/fixture.jsonl), and `python3 bench/run.py --self-test` runs
 the measurement path on real subprocesses and checks the size facts and share arithmetic; CI runs both.
 
+## Scheduling simulator
+
+[`simulate.py`](simulate.py) replays a recorded build's units (from a `cargo-timing.html`, or
+from the reports behind a results JSONL) under other scheduling policies and job counts:
+cargo's own order as a sanity check, FIFO, critical-path-first, `.rmeta` pipelining, and cache
+hits with or without a job slot. It estimates what Layer 3's scheduler (design §6) could gain
+before it is built, and how much of hypothesis 7 (scheduling gaps) is there to win. Its numbers
+are simulated estimates, targets to validate, never measurements. [SIMULATE.md](SIMULATE.md)
+gives the method, the assumptions and limits, and how to read the gap to the critical path.
+
+```sh
+python3 bench/simulate.py bench/results/raw/ripgrep/baseline-stable/cold-build/run-1/cargo-timing.html
+python3 bench/simulate.py bench/results/<date>-<label>.jsonl --scenario cold-build --jobs 1,2,4,8,16
+python3 bench/simulate.py <report> --hit-fraction 0.8 --cache-aware
+python3 bench/simulate.py --self-test
+```
+
+Reports passed directly are separate groups, so their medians are never pooled; pass
+`--group <name>` when several reports really are runs of the same build.
 ## Phase 2: cache scenarios
 
 Design §5 benchmarks kache against sccache, and the [shared-cache plan](../docs/tailscale-shared-cache.md)
