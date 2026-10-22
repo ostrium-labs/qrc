@@ -17,7 +17,7 @@ to validate.
 - Design: [docs/design.md](docs/design.md) (owner draft v0.2, fact-checked)
 - Phase 0 plan: [docs/phase-0.md](docs/phase-0.md)
 - Shared build cache over Tailscale (plan): [docs/tailscale-shared-cache.md](docs/tailscale-shared-cache.md)
-- Layer 3 scheduler plan: [docs/layer-3-scheduler.md](docs/layer-3-scheduler.md)
+- Layer 3 plan, `qrcd` and the opt-in loams-build research track (planned, not built): [docs/layer-3-scheduler.md](docs/layer-3-scheduler.md)
 
 ## The two-lane principle
 

@@ -1,138 +1,178 @@
-# Layer 3: qrcd Orchestrator & Build Engine (Buck2 Fork + TypeScript + Tailscale)
+# Layer 3: qrcd and loams-build (orchestrator plan)
 
-**Status:** plan, updated 2026-10-23.  
-**Owner decision:** `qrc` will fork and adapt **Meta's Buck2** in **Rust**, expanding from a Rust-specific compiler accelerator into an ultra-fast monorepo orchestrator (combining **Nx**-style developer ergonomics with Buck2's hermetic execution engine). It introduces native **TypeScript** support powered by the latest **Bun**, fast Rust-based TS toolchains (`tsrc` / `tsrs`), and seamless remote cache synchronization over **Tailscale** private object stores.
+**Status: planned, not built.** Nothing in this document exists yet. Every number below is either a
+measurement with a link to its source, or is labelled a target. Updated 2026-10-23.
 
----
+**Owner decision (2026-10-23):** go with **loams-build**, a fork of [Buck2](https://github.com/facebook/buck2)
+adapted for Rust and TypeScript monorepos, written in Rust.
 
-## 1. Goal & Strategic Vision
+## 1. Two tracks, and what is opt-in
 
-`qrc` began by targeting Rust debug compilation bottlenecks (where Phase 0 showed **45% to 72% of CPU time lost to scheduling gaps** on Nushell and Ripgrep).
+| | `qrcd` (design [§6](design.md)) | `loams-build` (this plan) |
+|---|---|---|
+| What it is | A scheduler that wraps Cargo: reads Cargo's unit graph and schedules units itself | A Buck2-based build engine that replaces Cargo as the build driver |
+| Build driver | Cargo stays | Buck2 (a fork) |
+| Status | Planned, not built | Planned, not built |
+| Who it is for | Everyone using Cargo | An **opt-in research track** |
 
-However, modern systems codebases (including Ostrium Labs' ecosystem with `loams`, `loams-mastra`, `client-rust`, and API services) are polyglot monorepos combining **Rust** backends and **TypeScript** frontend/AI agent services.
+Design [§1a](design.md) already named the main cost of Bazel or Buck2: it "requires leaving cargo as
+the build driver". That cost applies to loams-build in full. So:
 
-We are evolving `qrc` into a modern, unified build orchestrator:
-1. **The Core Engine:** A specialized fork of **Buck2** (written in Rust) providing incremental graph computation (Dice) and fine-grained action pipelining.
-2. **First-Class TypeScript Support:** High-performance TS execution, bundling, and testing powered by **Bun** and Rust-native tooling (`tsrc`, `tsrs`, SWC/OXC).
-3. **Monorepo Ergonomics (Nx-style):** Automatic workspace dependency graphs, affected task computation, task caching, and simple CLI commands (`qrc run`, `qrc affected`, `qrc test`).
-4. **Tailscale & Bucket Cache Integration:** Built-in remote cache streaming to S3-compatible bucket stores (RustFS) over private Tailscale WireGuard networks without public ingress.
+- **Plain Cargo stays supported** and remains the default. Layers 1 and 2 (the zero-code wins and an
+  adopted cache) and the Cargo-wrapping `qrcd` do not depend on loams-build.
+- **loams-build is gated on the results of Layers 1 and 2.** If those close most of the gap, the track
+  stops there. We only start it if the measurements still leave a gap worth the cost of leaving Cargo.
+- Nothing here changes how Loams builds today. The Loams monorepo uses Cargo for Rust and pnpm with
+  Nx for TypeScript, and keeps doing so.
 
----
+## 2. Evidence behind the plan
 
-## 2. Core Engine: Forking Meta's Buck2 in Rust
+Every figure is from a harness run committed to this repository. Idle share is design §2's
+hypothesis 7 (scheduling gaps): the fraction of the build's job slots (wall time times `-j`) that sat
+idle. All are cold builds with `baseline-stable`, one machine each, so they are first measurements,
+not a general result (Phase 0 requires reproduction on a second machine).
 
-Rather than building a new scheduler and action executor from scratch, `qrcd` will fork and tailor **Meta's Buck2** ([`facebook/buck2`](https://github.com/facebook/buck2)).
-
-### 2.1 Language Decision: Rust vs. Zig vs. Goose
-We evaluated three candidate systems languages for the orchestrator engine: **Rust**, **Zig**, and **Goose** ([`aardappel/goose`](https://github.com/aardappel/goose)).
-
-- **Goose (`aardappel/goose`) — Rejected:** Goose features no dynamic heap allocation, which is fundamentally incompatible with dynamic dependency graphs consisting of thousands of arbitrary nodes (e.g., `nushell`, `loams`, `zed`). It also lacks production POSIX IPC, jobserver protocols, and file-watching libraries, with no viable path to upstream contributions in `rust-lang`.
-- **Zig — Rejected:** Severe FFI impedance when interfacing with Cargo and rustc internals, inability to leverage Rust crates (`jobserver`, `notify`), and zero possibility of upstream adoption into Cargo.
-- **Rust — Selected:** Zero FFI overhead, sub-microsecond scheduling in release mode, direct crate reuse (`jobserver`, `tokio`, `notify`), and full compatibility with Buck2's codebase and `rust-lang`.
-
-### 2.2 Why Buck2 as the Foundation?
-- **Written 100% in Rust:** Matches our owner decision to use Rust exclusively. Zero FFI overhead, high concurrency, and direct integration with Rust's toolchain.
-- **The Dice Computation Engine:** Buck2's incremental computation framework tracks dependencies at fine granularity, re-evaluating only invalidated graph slices.
-- **Hermetic & Remote Execution API (REAPI):** Native understanding of action inputs/outputs, content-addressed storage (CAS), and remote execution caches.
-- **Extensible Rule System:** Rules are defined in Starlark, making it straightforward to add specialized Rust rules (`qrc_rust_library`, `qrc_rust_binary`) and TypeScript rules (`bun_package`, `ts_library`).
-
-### What We Strip & Tailor in the Fork:
-- Remove Meta-internal infrastructure dependencies and bloated toolchains.
-- Introduce zero-config auto-discovery for `Cargo.toml` and `package.json` workspaces so users do not have to write verbose `BUCK` files manually.
-- Integrate QRC's Phase 0 critical-path priority weighting directly into the Buck2 action execution loop (`app/buck2_execute`).
-
----
-
-## 3. TypeScript Integration: Bun, `tsrc`, and `tsrs`
-
-TypeScript builds in traditional monorepos suffer from slow `tsc` type-checking, heavy Node.js startup latency, and disjoint package managers. `qrc` unifies TypeScript workflows natively:
-
-### 3.1 Bun Runtime & Package Manager
-- **Runtime & Test Runner:** Use the latest **Bun** ([`bun.sh`](https://bun.sh)) for lightning-fast test execution (`bun test`), script execution, and bundling.
-- **Workspace Dependency Resolution:** Native lockfile ingestion (`bun.lock`) with instant symlinking of monorepo packages.
-
-### 3.2 Rust-Native TypeScript Tooling (`tsrc` / `tsrs`)
-- **Fast Transpilation (`tsrc`):** Integrate Rust-based TypeScript transpilation (via SWC or OXC engines) for sub-millisecond per-file compilation in debug lane workflows.
-- **Cross-Language Type Synthesis (`tsrs`):** Integrate `ts-rs` / Rust-TS reflection shims to automatically generate TypeScript interface definitions directly from Rust structs and enums across workspace boundaries, ensuring compile-time contract safety between Rust services and TypeScript clients.
-- **Declaration Pipelining (`.d.ts` Pipelining):** Analogous to Rust's `.rmeta` pipelining, downstream TypeScript libraries begin building as soon as upstream `.d.ts` declaration files are emitted, without waiting for JavaScript bundling.
-
----
-
-## 4. Monorepo Experience: Nx Ergonomics + Tailscale Caching
-
-`qrc` provides the developer experience of **Nx** with the speed of **Buck2** and the zero-trust security of **Tailscale**.
-
-```
-┌────────────────────────────────────────────────────────────────────────┐
-│                        Developer / CI Environment                      │
-│                                                                        │
-│  CLI:  qrc build //...  │  qrc affected --target=test  │  qrc dev      │
-└───────────────────────────────────┬────────────────────────────────────┘
-                                    │
-                                    ▼
-┌────────────────────────────────────────────────────────────────────────┐
-│ qrcd Orchestrator (Buck2 Core in Rust)                                 │
-│                                                                        │
-│  ┌────────────────────────┐              ┌──────────────────────────┐  │
-│  │ Rust Workspaces        │              │ TypeScript Workspaces    │  │
-│  │ (Cargo Unit Graph)     │              │ (Bun / package.json)     │  │
-│  └───────────┬────────────┘              └─────────────┬────────────┘  │
-│              │                                         │               │
-│              ▼                                         ▼               │
-│  ┌──────────────────────────────────────────────────────────────────┐  │
-│  │ Dice Incremental Graph & Critical-Path Scheduler (PR #10 / #12)  │  │
-│  │ - Rust .rmeta pipelining                                         │  │
-│  │ - TypeScript .d.ts pipelining                                    │  │
-│  └──────────────────────────────────┬───────────────────────────────┘  │
-└─────────────────────────────────────┼──────────────────────────────────┘
-                                      │ Encrypted WireGuard
-                                      ▼
-┌────────────────────────────────────────────────────────────────────────┐
-│ Remote Cache Store (S3-Compatible Object Storage over Tailscale)       │
-│                                                                        │
-│  - Storage Backend: RustFS / SeaweedFS (Port 9000)                     │
-│  - Network: tag:build-cache on Tailnet                                 │
-│  - Cache Hits: Restored asynchronously without burning jobserver slots │
-└────────────────────────────────────────────────────────────────────────┘
-```
-
-### 4.1 Affected Task Graph & Incremental Runs
-- Changes to Git commits or working tree files automatically identify the minimal subgraph of affected Rust crates and TypeScript packages (like `nx affected`).
-- Unaffected build targets and tests are restored instantly from cache.
-
-### 4.2 S3 Bucket & Tailscale Private Cache
-- Implements the [Tailscale shared build cache](tailscale-shared-cache.md) plan.
-- Buck2's remote cache backend is wired directly to an S3-compatible store (RustFS) listening on private Tailscale IP addresses.
-- **Zero-Slot Cache Hits:** When an action hash matches in the cache, the artifact is fetched and unpacked out-of-band without acquiring a jobserver concurrency token, keeping all CPU cores free for active compilations.
-
----
-
-## 5. Architectural Comparison: Prior Art & Lineage
-
-| Capability | Stock Cargo | Nx | Turborepo | **qrc (Buck2 Fork)** |
+| Workspace | Scenario | Idle share | Machine and toolchain | Source |
 |---|---|---|---|---|
-| **Language** | Rust | TypeScript | Go / Rust | **Rust** |
-| **Execution Engine** | JobQueue FIFO | Node.js Task Runner | Basic DAG | **Buck2 Dice Engine (Hermetic)** |
-| **Rust Pipelining** | Limited `.rmeta` | None | None | **Aggressive `.rmeta` Critical Path** |
-| **TS Engine** | N/A | `tsc` / esbuild | `tsc` / esbuild | **Bun + `tsrc`/`tsrs` + `.d.ts` Pipelining** |
-| **Cache Transport** | Local only | Nx Cloud (HTTP) | Vercel Remote Cache | **S3 / RustFS over Tailscale Mesh** |
-| **Job Allocation** | Burns slot on hit | N/A | Process slots | **Cache-aware slot bypass** |
+| nushell | cold-build | 45% | Intel Core Ultra 5 225H, 14 cores, `-j 14`, rustc 1.96.1 | [results](../bench/results/2026-10-22-intel-r-core-tm-ultra-5-225h.jsonl), [how it was run](../bench/results/2026-10-22-intel-r-core-tm-ultra-5-225h.md) (PR #14) |
+| nushell | cold-test | 21% | same | same |
+| ripgrep | cold-build | 42% | Apple M3, 8 cores, `-j 8`, rustc 1.99.1 | [phase-0.md](benchmarks/phase-0.md), [results](../bench/results/2026-10-22-apple-m3.jsonl) |
 
----
+An earlier draft of this plan quoted 72%. No committed result gives that figure, so it is removed.
+The harness is [`bench/run.py`](../bench/README.md); the critical-path and simulator tools it feeds
+are [`bench/critical_path.py`](../bench/README.md) (PR #10) and
+[`bench/simulate.py`](../bench/SIMULATE.md) (PR #12). Cache scenarios came in with PR #11.
 
-## 6. Implementation Milestones
+What these results do and do not say: a large share of slots sat idle on cold builds, which is a
+reason to look at scheduling. They do not say how much of that a better scheduler can recover. The
+simulator's output is an estimate to validate, not a measurement
+([SIMULATE.md](../bench/SIMULATE.md)).
 
-1. **Milestone 1 (Buck2 Core Fork):**
-   - Fork [`facebook/buck2`](https://github.com/facebook/buck2) into `crates/qrc-core` / `qrcd`.
-   - Strip internal Meta shims and enable standalone Rust build.
-2. **Milestone 2 (Cargo & Rust Adaptor):**
-   - Integrate auto-generation of Buck2 actions from `cargo --unit-graph`.
-   - Incorporate critical-path priority weighting derived from `bench/critical_path.py` (PR #10) and `bench/simulate.py` (PR #12).
-3. **Milestone 3 (Bun & TypeScript Integration):**
-   - Implement `bun_package` and `ts_library` rules.
-   - Wire `tsrc` / OXC for sub-millisecond transpilation and `tsrs` for Rust-TypeScript type sharing.
-   - Enable `.d.ts` pipelining to unblock dependent TypeScript packages early.
-4. **Milestone 4 (Tailscale S3 Cache Provider):**
-   - Connect Buck2's CAS / HTTP caching client to S3-compatible endpoints over Tailscale (`tag:build-cache`).
-5. **Milestone 5 (Nx-Style Developer CLI):**
-   - Deliver `qrc build`, `qrc test`, `qrc affected`, and `qrc run` CLI commands with zero-config workspace detection.
+**Targets (not measured):**
+
+- Scheduling overhead per unit of the new scheduler: **target** under 1 ms per unit, to be measured
+  once something exists. An earlier draft said "sub-microsecond"; that was a guess and is removed.
+- Any wall-time gain over plain Cargo: no target is set until Phase 0 and the simulator give one.
+
+## 3. Language and name
+
+- **Name:** the engine is **loams-build**. `qrcd` is the Cargo-wrapping daemon from design §6. Both
+  are Rust.
+- **Rust only** for `qrcd` and loams-build. Buck2 is written in Rust, so a fork stays in one language
+  and can reuse crates such as `jobserver`, `tokio` and `notify`. Zig and Goose were considered and
+  not chosen; this plan does not rest on any claim about them that is not sourced. Design §9 and §16
+  are updated to match. The optional single-pass backend (design §7) is a separate question and
+  stays open.
+
+## 4. The Buck2 fork
+
+### 4.1 Licence
+
+Buck2 is licensed **MIT OR Apache-2.0**: the repository carries `LICENSE-MIT` and `LICENSE-APACHE`
+and a `NOTICE` file, and its README says it is under both licences
+([facebook/buck2](https://github.com/facebook/buck2)). Checked 2026-10-23. A fork must keep the
+copyright notices, both licence files and the `NOTICE` file, and mark changed files as changed.
+qrc itself is MIT OR Apache-2.0 ([CONTRIBUTING.md](../CONTRIBUTING.md)), so the two are compatible.
+
+### 4.2 Fork policy: upstream first, small patch queue
+
+- A change that is not specific to Meta's setup goes to `facebook/buck2` as a pull request first.
+- What upstream does not take stays in a small, ordered patch queue on top of upstream.
+- The fork is **rebased on upstream regularly**, so the queue stays small and short-lived. This is the
+  same pattern Loams uses for its other forks, and it fits the repository's rule to
+  [contribute upstream](../CONTRIBUTING.md) rather than fork.
+- **The fork repository is not created yet.** It is created, under `ostrium-labs`, at the first
+  milestone that needs a patch. Until then we use stock Buck2 and write no patches.
+
+### 4.3 Why Buck2
+
+- Written in Rust, so no foreign-language boundary.
+- Incremental computation (DICE) re-evaluates only the parts of the graph that changed.
+- Actions have declared inputs and outputs, and Buck2 speaks the Remote Execution API for
+  content-addressed caching.
+- Rules are written in Starlark, so Rust and TypeScript rules can be added without changing the engine.
+
+These are properties from Buck2's own documentation, not something qrc measured.
+
+### 4.4 Reuse before writing
+
+Before writing any discovery layer that turns `Cargo.toml` into build targets, evaluate what exists:
+
+- **Buck2's Rust prelude** (`prelude/rust` in the Buck2 repository, with rules such as `rust_library`
+  and `rust_binary`, a `cargo_package.bzl` and a build-script runner).
+- **[reindeer](https://github.com/facebookincubator/reindeer)** (`facebookincubator/reindeer`), Meta's
+  tool that generates Buck targets from a Cargo workspace's dependencies. Licence: MIT (GitHub's
+  licence detection and its `LICENSE` file, checked 2026-10-23).
+
+Milestone 2 starts with that evaluation: run both on the Loams workspace and on nushell, and write
+down what they cannot do (for example build scripts, proc macros, features, test targets) before
+deciding whether any new layer is needed. The Cargo unit graph from
+`cargo +nightly build --unit-graph -Zunstable-options` is the fallback source of truth, and it is
+what `qrcd` consumes either way.
+
+## 5. TypeScript
+
+Tool names, checked 2026-10-23:
+
+| Tool | What it is | Licence | Notes |
+|---|---|---|---|
+| [Bun](https://bun.sh) ([oven-sh/bun](https://github.com/oven-sh/bun)) | JavaScript runtime, package manager, test runner and bundler | MIT; the repository's `LICENSE.md` says "Bun itself is MIT-licensed" and lists statically linked libraries (JavaScriptCore is LGPL-2) | Used for running and testing |
+| [OXC](https://github.com/oxc-project/oxc) | Rust JavaScript and TypeScript parser, transformer, linter | MIT | Candidate TypeScript transpiler |
+| [SWC](https://github.com/swc-project/swc) | Rust TypeScript and JavaScript compiler | Apache-2.0 | Candidate TypeScript transpiler |
+| [ts-rs](https://github.com/Aleph-Alpha/ts-rs) (crate `ts-rs`) | Generates TypeScript type declarations from Rust types | MIT | Contract types between Rust services and TypeScript clients |
+
+- **`tsrc` is not a tool we can use.** An earlier draft named it as a Rust TypeScript transpiler. No
+  such tool exists: the crates.io name `tsrc` is reserved for a TypeScript compiler project with "no
+  code yet", and the other tool called `tsrc` on GitHub (your-tools/tsrc) manages groups of git
+  repositories. It is replaced by **OXC's transformer or SWC**, to be chosen by a small benchmark.
+  Transpiling does not type-check, so type checking stays with `tsc` (or whatever the project
+  already uses) until a faster checker is shown to be good enough.
+- **`tsrs` meant `ts-rs`.** The npm name `tsrs` is an unrelated project (a Rust port of the
+  TypeScript compiler); do not confuse it with `ts-rs`.
+- **Bun does not replace pnpm or Nx in Loams.** The Loams monorepo uses pnpm and Nx today and keeps
+  them. Bun starts as the test and runtime step for qrc's own TypeScript targets only.
+
+Plan, in order: `bun test` as a Buck2 test rule for qrc's own TypeScript; then a transpile rule
+(OXC or SWC); then `ts-rs` generation as a build step; and only then any `.d.ts` pipelining, which
+is a research idea (start downstream packages once declarations exist, like Rust's `.rmeta`), with no
+evidence yet that it helps.
+
+## 6. Developer experience (Nx-style), planned
+
+The goal is commands in the style of Nx: `qrc build`, `qrc test`, `qrc affected`, `qrc run`. Affected
+computation means: from the Git diff, find the Rust crates and TypeScript packages whose inputs
+changed and run only those. The Rust side can use the unit graph; the TypeScript side reads
+`package.json` workspaces. None of it exists yet.
+
+## 7. Remote cache over Tailscale
+
+This plan does not repeat the cache design. It is in
+[tailscale-shared-cache.md](tailscale-shared-cache.md), and the deployment files merged in PR #13 are
+in [deploy/shared-cache/](../deploy/shared-cache/README.md). That setup is an sccache store on a
+tailnet. Pointing Buck2's remote cache client at the same kind of store is a later milestone and
+depends on what Buck2 supports; it is not assumed here. Those deployment files have not yet been run
+against a real tailnet (their README says so).
+
+Cache-aware scheduling (do not occupy a job slot for a cache hit) is design §6's idea and stays a
+design idea until measured.
+
+## 8. Milestones
+
+All planned, none started. Each starts only if the previous one's result justifies it.
+
+0. **Gate:** Layers 1 and 2 results are in (design §4 and §5), and a gap remains. Without this, stop.
+1. **Stock Buck2 trial (no fork):** build a small Rust workspace with unmodified Buck2 and its Rust
+   prelude. Get the unit graph with `cargo +nightly build --unit-graph -Zunstable-options`
+   (the output is already JSON; `--json` is not a `cargo build` flag) and compare it with the targets
+   Buck2 sees. Record what is missing.
+2. **Discovery evaluation:** Buck2's Rust prelude and reindeer against the Loams workspace and nushell
+   (section 4.4). Decide whether a new discovery layer is needed.
+3. **First patch, and the fork:** only if a change is needed that upstream will not take, create the
+   fork under `ostrium-labs` and start the patch queue (section 4.2). Critical-path priority weighting
+   from `bench/critical_path.py` and `bench/simulate.py` is the likely first change.
+4. **TypeScript:** `bun test` rule, then transpile rule, then `ts-rs` generation (section 5).
+5. **Remote cache:** Buck2 against the Tailscale store (section 7).
+6. **CLI:** `qrc build`, `qrc test`, `qrc affected`, `qrc run` (section 6).
+
+Success for the whole track is a measured wall-time gain on cold and incremental builds against plain
+Cargo with the same cache, on at least two machines. Until then it is research.
