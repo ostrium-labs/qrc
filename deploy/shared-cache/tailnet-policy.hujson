@@ -1,0 +1,56 @@
+// The shared cache's part of the tailnet policy file (docs/tailscale-shared-cache.md §3.1).
+// The owner merges these sections into the tailnet's policy in the Tailscale admin console;
+// a second maintainer reviews the change. Values in angle brackets are placeholders: no
+// real login, tailnet name or address belongs in this repository.
+//
+// Tailscale denies by default, so these grants are the only way to the store. The `tests`
+// assert both sides: who can reach it, and who cannot. Tailscale refuses to save a policy
+// whose tests fail, so a later edit cannot widen the access without failing them.
+{
+  "groups": {
+    "group:maintainers": ["<maintainer-1@example.org>", "<maintainer-2@example.org>"],
+  },
+
+  "tagOwners": {
+    // The always-on store box, and the ephemeral CI runners.
+    "tag:build-cache": ["group:maintainers"],
+    "tag:ci":          ["group:maintainers"],
+  },
+
+  "grants": [
+    // Maintainers' devices reach the store on the S3 port, TCP only, nothing else.
+    { "src": ["group:maintainers"], "dst": ["tag:build-cache"], "ip": ["tcp:9000"] },
+    // CI runners reach the store on the S3 port, and nothing else on the tailnet.
+    { "src": ["tag:ci"], "dst": ["tag:build-cache"], "ip": ["tcp:9000"] },
+    // No other rule names tag:build-cache or tag:ci. Do not add "*" rules.
+  ],
+
+  "tests": [
+    {
+      // A maintainer reaches the S3 port, and only the S3 port.
+      "src": "<maintainer-1@example.org>",
+      "proto": "tcp",
+      "accept": ["tag:build-cache:9000"],
+      "deny": ["tag:build-cache:22", "tag:build-cache:9001"],
+    },
+    {
+      // CI reaches the S3 port only: not the store's other ports, and no maintainer device.
+      "src": "tag:ci",
+      "proto": "tcp",
+      "accept": ["tag:build-cache:9000"],
+      "deny": ["tag:build-cache:22", "tag:build-cache:9001", "<maintainer-1@example.org>:22", "<maintainer-1@example.org>:443"],
+    },
+    {
+      // The store reaches nobody: it only answers.
+      "src": "tag:build-cache",
+      "proto": "tcp",
+      "deny": ["<maintainer-1@example.org>:22", "tag:ci:22"],
+    },
+    {
+      // A tailnet member who is not a maintainer gets nothing from the store.
+      "src": "<non-maintainer@example.org>",
+      "proto": "tcp",
+      "deny": ["tag:build-cache:9000"],
+    },
+  ],
+}

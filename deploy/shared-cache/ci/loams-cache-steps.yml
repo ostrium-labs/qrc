@@ -1,0 +1,134 @@
+# The shared build cache steps for ostrium-labs/loams (docs/tailscale-shared-cache.md §6.5).
+#
+# Put these steps in loams' build and test jobs only, after the Rust toolchain is
+# installed and before the first cargo command. Never put them in a release, package,
+# sign, promote or publish workflow: check_release_workflows.py fails loams' CI if a
+# release workflow mentions them (§3.5). The workflow around the steps is only an example.
+#
+# Values in angle brackets are placeholders. The secrets are set by the owner (§6.3).
+#
+# Pins: third-party actions are pinned by full commit SHA, with the release the SHA was
+# taken from in the comment, and that release is at least 14 days old when pinned.
+# tailscale/github-action v4.3.0 came out on 2026-10-22, so v4.2.0 (2026-09-22) is used.
+# sccache itself is pinned to v0.18.0, the version the settings were checked against.
+
+name: Test
+
+on:
+  push:
+    branches: [dev]
+  # pull_request, never pull_request_target or workflow_run (§3.4): GitHub gives no
+  # secrets to pull requests from forks, so they skip every cache step below.
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      # 'true' only when the run has the secrets, so never on a fork pull request.
+      HAS_CACHE_SECRETS: ${{ secrets.TS_OAUTH_SECRET != '' && secrets.SCCACHE_CI_RO_SECRET != '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # loams' toolchain step goes here (it already has one).
+
+      - name: Join the tailnet (shared cache)
+        id: tailnet
+        if: env.HAS_CACHE_SECRETS == 'true'
+        # A Tailscale outage must not fail the job: the build then runs without the cache.
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd # v4.2.0
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          # Nodes this action registers with an OAuth client are ephemeral.
+
+      - name: Install sccache (shared cache)
+        id: sccache
+        if: env.HAS_CACHE_SECRETS == 'true' && steps.tailnet.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.18.0
+          # The action's post step runs `sccache --show-stats` and fails the job if that
+          # fails, for example when the store went away during the job. The last step
+          # below shows the stats instead, without failing the job.
+          disable_annotations: true
+
+      # Turn the cache on only if the store answers and the sccache server starts. If the
+      # store cannot be reached when the server starts, sccache 0.18.0 does not start the
+      # server and every compile fails, even with SCCACHE_IGNORE_SERVER_IO_ERROR=1, which
+      # only covers errors after the server is up. sccache has no S3 timeout settings, so
+      # the probe's --max-time also keeps a down store from costing a TCP timeout per crate.
+      - name: Turn on the shared cache if the store answers
+        if: >-
+          env.HAS_CACHE_SECRETS == 'true' &&
+          steps.tailnet.outcome == 'success' && steps.sccache.outcome == 'success'
+        continue-on-error: true
+        # Generous because `rustc -vV` may install the pinned toolchain on first use.
+        timeout-minutes: 5
+        env:
+          SCCACHE_BUCKET: rust-cache
+          SCCACHE_ENDPOINT: http://<build-cache-tailnet-name>:9000
+          SCCACHE_REGION: us-east-1
+          SCCACHE_S3_USE_SSL: 'false'
+          # Path-style addressing is sccache's default; there is no PATH_STYLE setting.
+          # The ci-ro key cannot write anyway; READ_ONLY also stops sccache from trying.
+          SCCACHE_S3_RW_MODE: READ_ONLY
+          SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
+          # Keep the server up for the whole job: a server restarted while the store is
+          # unreachable would fail the build (see above).
+          SCCACHE_IDLE_TIMEOUT: '0'
+          AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_CI_RO_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_CI_RO_SECRET }}
+        run: |
+          if ! curl -fsS --max-time 3 -o /dev/null "$SCCACHE_ENDPOINT/health"; then
+            echo "::notice title=Shared cache off::The store did not answer; building without it."
+            exit 0
+          fi
+          # The same key prefix formula as the maintainer laptops (client/sccache.env.example).
+          release="$(rustc -vV | sed -n 's/^release: //p')"
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          export SCCACHE_S3_KEY_PREFIX="$release/$host"
+          if ! sccache --start-server; then
+            echo "::notice title=Shared cache off::sccache could not start against the store; building without it."
+            sccache --stop-server > /dev/null 2>&1 || true
+            exit 0
+          fi
+          # Later steps get the same settings, so a server that has to be restarted (after
+          # a crash) uses the same store and key.
+          for name in SCCACHE_BUCKET SCCACHE_ENDPOINT SCCACHE_REGION SCCACHE_S3_USE_SSL \
+                      SCCACHE_S3_RW_MODE SCCACHE_IGNORE_SERVER_IO_ERROR SCCACHE_IDLE_TIMEOUT \
+                      SCCACHE_S3_KEY_PREFIX AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
+            printf '%s=%s\n' "$name" "${!name}"
+          done >> "$GITHUB_ENV"
+          {
+            echo "RUSTC_WRAPPER=sccache"
+            echo "CARGO_INCREMENTAL=0"
+            echo "SHARED_CACHE=on"
+          } >> "$GITHUB_ENV"
+          echo "Shared cache on: $SCCACHE_ENDPOINT, prefix $SCCACHE_S3_KEY_PREFIX, read-only."
+
+      # loams' existing build and test steps follow, unchanged, for example:
+      - run: cargo nextest run --workspace --locked
+
+      - name: Shared cache stats
+        if: always() && env.HAS_CACHE_SECRETS == 'true' && env.SHARED_CACHE == 'on'
+        continue-on-error: true
+        timeout-minutes: 1
+        run: sccache --show-stats
+
+# Optional, later (§3.2): CI writes on pushes to dev. That job would run only for
+# `github.event_name == 'push' && github.ref == 'refs/heads/dev'`, declare
+# `environment: cache-write` (an environment whose deployment branches are limited to
+# dev), read SCCACHE_CI_RW_KEY_ID and SCCACHE_CI_RW_SECRET from it, and drop
+# SCCACHE_S3_RW_MODE. Everything else stays as above.

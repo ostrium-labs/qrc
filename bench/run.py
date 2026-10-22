@@ -17,6 +17,12 @@ finished) rather than run as its own build; see the bench README.
 Configurations (plan §3): `baseline-stable` and `baseline-nightly` are Phase 0's. The Phase 1
 names are defined here already so Phase 1 is a flag away, but they are not measured in Phase 0.
 
+Phase 2 (design §5): `--cache sccache` or `--cache kache` runs the cache scenarios (cache-cold,
+cache-hit, cache-partial, cache-warm-local) through that cache, with an empty cache directory of
+the invocation's own under the work directory. See the bench README.
+
+    python3 bench/run.py ripgrep --cache sccache       # the four cache scenarios, 3 runs each
+
 Nothing here reads or writes outside the work directory, the results file and the raw directory.
 """
 
@@ -24,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import fcntl
 import json
 import os
 import platform
@@ -36,11 +43,16 @@ import time
 import tomllib
 from pathlib import Path
 
+import critical_path
+
 SCHEMA = 1
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
 
 SCENARIOS = ("cold-build", "cold-test", "check", "noop", "touch-leaf", "touch-core", "deps-only")
+# Phase 2 (design §5; docs/tailscale-shared-cache.md §5): the build through a cache wrapper.
+CACHE_SCENARIOS = ("cache-cold", "cache-hit", "cache-partial", "cache-warm-local")
+CACHES = ("none", "sccache", "kache")
 
 # name -> (needs nightly, extra RUSTFLAGS, extra env, note)
 CONFIGS: dict[str, tuple[bool, list[str], dict[str, str], str]] = {
@@ -488,14 +500,314 @@ def summarize_profiles(prof_dir: Path) -> dict | None:
     return {"profiles": len(files), "crates": per_crate}
 
 
+# --- the build cache under test (Phase 2) ---------------------------------------------------
+
+# Generous, so nothing is evicted during an invocation: an eviction would read as a miss.
+CACHE_SIZE = {"sccache": "200G", "kache": "200GiB"}
+# Shell variables that would change what a run measures, or where its cache lives. Remote
+# backend settings (SCCACHE_BUCKET, KACHE_S3_*, ...) are not among them: they pass through.
+CACHE_UNSET = {
+    "sccache": ("SCCACHE_NO_DAEMON", "SCCACHE_START_SERVER", "SCCACHE_RECACHE", "SCCACHE_CLIENT_SIDE"),
+    "kache": ("KACHE_DISABLED", "KACHE_RUNTIME_DIR", "KACHE_SOCKET_PATH", "KACHE_TRUST_DOMAIN", "KACHE_READONLY_STORE"),
+}
+INSTALL_HINT = {"sccache": "cargo install sccache --locked", "kache": "cargo install kache --locked"}
+KACHE_SUMMARY = ("local_hits", "prefetch_hits", "remote_hits", "misses", "dups", "errors", "passthroughs")
+KACHE_TIMING = ("total_restore_ms", "total_store_ms")
+
+
+class CacheStillRunning(RuntimeError):
+    """The kache daemon did not exit, so its store must not be wiped underneath it."""
+
+
+def read_toml(path: Path) -> dict:
+    try:
+        with open(path, "rb") as f:
+            return tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+
+
+def sccache_backend(env: dict[str, str]) -> str:
+    """"s3" when the shell sets up sccache's S3 backend (SCCACHE_BUCKET, or `[cache.s3]` in an
+    exported SCCACHE_CONF), else "local". A run that used some other cache is caught after it:
+    the server reports where it stored entries (cache_after)."""
+    if env.get("SCCACHE_BUCKET"):
+        return "s3"
+    conf = env.get("SCCACHE_CONF")
+    if conf and "s3" in (read_toml(Path(conf)).get("cache") or {}):
+        return "s3"
+    return "local"
+
+
+def kache_backend(env: dict[str, str]) -> str:
+    """The remote kache will use, in its own order: `[cache.remote]` in an exported KACHE_CONFIG,
+    then KACHE_S3_BUCKET, then `[cache.remote]` in an exported KACHE_HOST_CONFIG; its `type`, or
+    what kache infers without one (`filesystem` when `path` is set, else `s3`). "local" with no
+    remote, or with KACHE_LOCAL_ONLY."""
+    if env.get("KACHE_LOCAL_ONLY", "").lower() in ("1", "true"):
+        return "local"
+
+    def remote(var: str) -> dict | None:
+        r = (read_toml(Path(env[var])).get("cache") or {}).get("remote") if env.get(var) else None
+        return r if isinstance(r, dict) else None
+
+    r = remote("KACHE_CONFIG")
+    if r is None and env.get("KACHE_S3_BUCKET"):
+        return "s3"
+    r = r or remote("KACHE_HOST_CONFIG")
+    if r is None:
+        return "local"
+    return str(r.get("type") or ("filesystem" if "path" in r else "s3"))
+
+
+def find_cache(tool: str) -> dict | None:
+    """The cache under test: its binary on PATH, version and backend. Exits if it is missing."""
+    if tool == "none":
+        return None
+    path = shutil.which(tool)
+    if not path:
+        sys.exit(f"--cache {tool}: `{tool}` is not on PATH; install it ({INSTALL_HINT[tool]}) or choose another --cache")
+    version = first_line(run([path, "--version"]).stdout) or "unknown"
+    backend = sccache_backend(dict(os.environ)) if tool == "sccache" else kache_backend(dict(os.environ))
+    if tool == "kache" and os.environ.get("KACHE_S3_BUCKET"):
+        log("note: kache's daemon drops KACHE_S3_* from its environment (kache docs, Configuration: "
+            "Pin file-backed settings); unless an exported KACHE_CONFIG names the remote, only the wrappers see it")
+    return {"tool": tool, "path": path, "version": version, "backend": backend, "unset": CACHE_UNSET[tool]}
+
+
+def prepare_cache(cache: dict, work: Path, ws_name: str) -> None:
+    """This invocation's own cache directory under the work directory, and the environment that
+    points the tool at it. Settings the user exported for the tool's config files are kept."""
+    stamp = dt.datetime.now().strftime("%Y%m%dT%H%M%S")
+    root = work / "cache" / f"{cache['tool']}-{ws_name}-{stamp}-{os.getpid()}"
+    store = root / "store"
+    # Its own server socket, so a server already running for the user's builds (port 4226)
+    # never serves a benchmark build.
+    sock = root / "server.sock"
+    if cache["tool"] == "sccache" and len(os.fsencode(sock)) > 100:
+        sys.exit(f"the sccache socket path {sock} is too long for a Unix socket; use a shorter --work")
+    store.mkdir(parents=True)
+    env: dict[str, str] = {}
+    if cache["tool"] == "sccache":
+        # The harness stops the server itself; the idle timeout only ends one it left behind.
+        env.update({"SCCACHE_DIR": str(store), "SCCACHE_CACHE_SIZE": CACHE_SIZE["sccache"],
+                    "SCCACHE_SERVER_UDS": str(sock), "SCCACHE_IDLE_TIMEOUT": "3600"})
+        if "SCCACHE_CONF" not in os.environ:
+            (root / "sccache.toml").write_text("")
+            env["SCCACHE_CONF"] = str(root / "sccache.toml")
+    else:
+        # KACHE_SEED_NEW_TARGETS=0: seeding copies dependency units from another target directory
+        # into a new one, so they never reach the wrapper; kache's own benchmark turns it off too.
+        # A zero free-space floor is kache's CI default; below 10 GiB free, builds would
+        # otherwise evict cache entries mid-run.
+        env.update({"KACHE_CACHE_DIR": str(store), "KACHE_MAX_SIZE": CACHE_SIZE["kache"],
+                    "KACHE_SEED_NEW_TARGETS": "0", "KACHE_AUTO_RECOVER_MIN_FREE_BYTES": "0"})
+        if "KACHE_CONFIG" not in os.environ:
+            (root / "kache.toml").write_text("")
+            env["KACHE_CONFIG"] = str(root / "kache.toml")
+        if "KACHE_HOST_CONFIG" not in os.environ:
+            env["KACHE_HOST_CONFIG"] = ""  # empty turns /etc/kache/config.toml off
+    cache.update({"root": root, "store": store, "env": env})
+
+
+def cache_tool(cache: dict, env: dict[str, str], args: list[str], capture: bool = False) -> subprocess.CompletedProcess | None:
+    """One sccache or kache command with the run's environment; None if it could not run.
+    Output goes to /dev/null unless captured: a server it starts must not hold our pipes."""
+    out = subprocess.PIPE if capture else subprocess.DEVNULL
+    try:
+        return subprocess.run([cache["path"], *args], env=env, text=True, stdin=subprocess.DEVNULL,
+                              stdout=out, stderr=out, timeout=600, check=False)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log(f"  {cache['tool']} {' '.join(args)}: {e}")
+        return None
+
+
+def wait_unlocked(lock: Path, timeout: float) -> bool:
+    """Until no process holds `lock` (kache's daemon holds daemon.run.lock while it runs)."""
+    try:
+        fd = os.open(lock, os.O_WRONLY)
+    except FileNotFoundError:
+        return True  # no daemon has run
+    except OSError:
+        return False
+    try:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True  # closing the descriptor releases the probe
+            except BlockingIOError:
+                pass
+            except OSError:
+                return False
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
+    finally:
+        os.close(fd)
+
+
+def cache_stop(cache: dict, env: dict[str, str]) -> float:
+    """Stop this invocation's sccache server or kache daemon; the seconds that took. kache's
+    daemon first finishes work a build queued (uploads to a remote, for one); sccache has written
+    each entry before the compile returns. A no-op when none is running. Raises CacheStillRunning
+    when kache's daemon is still alive: its store must not be wiped or reused while it could be
+    writing into it."""
+    t0 = time.monotonic()
+    if cache["tool"] == "sccache":
+        cache_tool(cache, env, ["--stop-server"])
+        Path(env["SCCACHE_SERVER_UDS"]).unlink(missing_ok=True)
+    else:
+        cache_tool(cache, env, ["daemon", "stop"])
+        if not wait_unlocked(cache["store"] / "daemon.run.lock", 900):
+            cache["still_running"] = True
+            raise CacheStillRunning(
+                f"the kache daemon was still running 15 minutes after `kache daemon stop`; "
+                f"leaving {cache['store']} in place")
+    return round(time.monotonic() - t0, 3)
+
+
+def cache_wipe(cache: dict) -> None:
+    """Empty the local cache directory. The server or daemon must be stopped first."""
+    shutil.rmtree(cache["store"], ignore_errors=True)
+    cache["store"].mkdir(parents=True)
+
+
+def sccache_stats(info: dict) -> dict:
+    """The counters of `sccache --show-stats --stats-format json` (sccache 0.18.0's ServerInfo:
+    per-language counts under `counts`, durations as `secs` and `nanos`)."""
+    s = info.get("stats") or {}
+
+    def count(v) -> int:
+        return sum(int(x) for x in (v.get("counts") or {}).values()) if isinstance(v, dict) else int(v or 0)
+
+    def secs(v) -> float | None:
+        return round(v.get("secs", 0) + v.get("nanos", 0) / 1e9, 3) if isinstance(v, dict) else None
+
+    hits, misses = count(s.get("cache_hits")), count(s.get("cache_misses"))
+    return {
+        "hits": hits,
+        "misses": misses,
+        "errors": count(s.get("cache_errors")),
+        "hit_rate": round(hits / (hits + misses), 4) if hits + misses else None,
+        "read_s": secs(s.get("cache_read_hit_duration")),
+        "write_s": secs(s.get("cache_write_duration")),
+        "writes": count(s.get("cache_writes")),
+        "read_errors": count(s.get("cache_read_errors")),
+        "write_errors": count(s.get("cache_write_errors")),
+        "timeouts": count(s.get("cache_timeouts")),
+        "not_cacheable": count(s.get("requests_not_cacheable")) + count(s.get("non_cacheable_compilations")),
+    }
+
+
+def kache_totals(report: dict) -> dict[str, int]:
+    """kache's cumulative counters from its report (`kache report --format json`; the schema is
+    kache's docs/commands/report.schema.json): one count per compiler event in the window."""
+    s, t = report.get("summary") or {}, report.get("timing") or {}
+    totals = {k: int(s.get(k) or 0) for k in KACHE_SUMMARY}
+    totals.update({k: int(t.get(k) or 0) for k in KACHE_TIMING})
+    return totals
+
+
+def kache_stats(before: dict[str, int], after: dict[str, int]) -> dict:
+    """The timed build's share of kache's counters: the totals after it minus those before. A
+    duplicate (`dups`, a compile another compile of the same key was already building) is
+    counted as a miss, as kache's own hit rate counts it."""
+    d = {k: after[k] - before.get(k, 0) for k in after}
+    hits = d["local_hits"] + d["prefetch_hits"] + d["remote_hits"]
+    misses = d["misses"] + d["dups"]
+    return {
+        "hits": hits,
+        "misses": misses,
+        "errors": d["errors"],
+        "hit_rate": round(hits / (hits + misses), 4) if hits + misses else None,
+        "read_s": round(d["total_restore_ms"] / 1000, 3),
+        "write_s": round(d["total_store_ms"] / 1000, 3),
+        "local_hits": d["local_hits"],
+        "prefetch_hits": d["prefetch_hits"],
+        "remote_hits": d["remote_hits"],
+        "passthroughs": d["passthroughs"],
+    }
+
+
+def kache_report(cache: dict, env: dict[str, str]) -> dict[str, int] | None:
+    r = cache_tool(cache, env, ["report", "--format", "json", "--since", "365d"], capture=True)
+    if r is None or r.returncode:
+        return None
+    try:
+        return kache_totals(json.loads(r.stdout))
+    except (json.JSONDecodeError, AttributeError, TypeError, ValueError):
+        return None
+
+
+def cache_before(cache: dict, env: dict[str, str]) -> dict[str, int] | None:
+    """Untimed, right before the timer: sccache's counters zeroed (which starts its server when
+    none runs), or kache's totals so far and its daemon started."""
+    if cache["tool"] == "sccache":
+        r = cache_tool(cache, env, ["--zero-stats"])
+        if r is None or r.returncode:
+            log("  warning: sccache --zero-stats failed; this run's cache_stats may include earlier builds")
+        return None
+    before = kache_report(cache, env)
+    if before is None and not (cache["store"] / "events.jsonl").exists():
+        before = kache_totals({})  # nothing logged yet
+    cache_tool(cache, env, ["daemon", "start"])
+    return before
+
+
+def cache_after(cache: dict, env: dict[str, str], before: dict[str, int] | None) -> tuple[dict, str | None]:
+    """The timed build's cache counters, then the server or daemon stopped (`stop_s`). The second
+    value is a reason to reject the run: the sccache server stored entries somewhere other than
+    the cache set up for this invocation. The location itself only goes to the log: it can name
+    a bucket or a home directory, and results are committed."""
+    if cache["tool"] == "sccache":
+        invalid = None
+        r = cache_tool(cache, env, ["--show-stats", "--stats-format", "json"], capture=True)
+        try:
+            info = json.loads(r.stdout) if r is not None and r.returncode == 0 else None
+        except json.JSONDecodeError:
+            info = None
+        if not isinstance(info, dict):
+            stats = {"error": "sccache --show-stats gave no JSON"}
+        else:
+            stats = sccache_stats(info)
+            location = str(info.get("cache_location", ""))
+            if cache["backend"] == "s3":
+                used_ours = location.lower().startswith("s3")
+            else:
+                used_ours = str(cache["store"]) in location
+            if not used_ours:
+                log(f"  sccache stored entries in {location!r}, not this invocation's {cache['backend']} cache")
+                invalid = f"sccache did not use this invocation's {cache['backend']} cache (see the log)"
+        stats["stop_s"] = cache_stop(cache, env)
+        # A failed counter read is a rejected run: analyze.py only sees the row's `error`, and a
+        # hit rate of n/a with no reason reads as a successful run that had nothing to count.
+        return stats, invalid or stats.get("error")
+    # kache: stopped first, so whatever its daemon finishes after the build is in the report.
+    stop_s = cache_stop(cache, env)
+    after = kache_report(cache, env)
+    stats = kache_stats(before, after) if before is not None and after is not None else {"error": "kache report gave no JSON before or after the build"}
+    stats["stop_s"] = stop_s
+    return stats, stats.get("error")
+
+
 # --- one run -------------------------------------------------------------------------------
 
 
-def cargo_env(base: dict[str, str], config: str, target: Path, prof_dir: Path | None) -> dict[str, str]:
+def cargo_env(base: dict[str, str], config: str, target: Path, prof_dir: Path | None,
+              cache: dict | None = None) -> dict[str, str]:
     env = dict(base)
     env["CARGO_TARGET_DIR"] = str(target)
     env.pop("RUSTC_WRAPPER", None)  # no build cache in the baseline (plan §6)
     env.pop("RUSTC_WORKSPACE_WRAPPER", None)
+    if cache is not None:
+        # Phase 2: the cache under test is the wrapper. Incremental compilation is off: neither
+        # tool caches incremental units, and design §5 keeps it off in CI.
+        for k in cache["unset"]:
+            env.pop(k, None)
+        env.update(cache["env"])
+        env["RUSTC_WRAPPER"] = cache["path"]
+        env["CARGO_INCREMENTAL"] = "0"
     env["CARGO_TERM_COLOR"] = "never"
     rustflags = list(CONFIGS[config][1])
     if prof_dir is not None:
@@ -527,7 +839,8 @@ def one_run(ctx: dict, scenario: str, index: int) -> list[dict]:
     # time (ripgrep's cold build went from 7 s to 11 s with it on), and the flag is part of
     # RUSTFLAGS, so it also decides what a warm build sees as fresh. The phase data for the
     # cold scenarios comes from one extra, untimed, profiled build after the timed one.
-    env = cargo_env(ctx["env"], config, target, None)
+    cache: dict | None = ctx["cache"]
+    env = cargo_env(ctx["env"], config, target, None, cache)
     base_cmd = cargo + ["--offline"] if ctx["offline"] else cargo
     profiled = CONFIGS[config][0] and scenario in ("cold-build", "deps-only", "cold-test", "check")
 
@@ -548,6 +861,20 @@ def one_run(ctx: dict, scenario: str, index: int) -> list[dict]:
         if r.returncode:
             sys.exit(f"warm-up build failed:\n{r.stderr[-2000:]}")
 
+    def populate() -> None:
+        """Fill the cache with one untimed build from a clean target, so every unit goes through
+        the wrapper, unless this invocation has filled it already; then stop the server or
+        daemon, which lets it finish writing and keeps its state out of the timed build."""
+        if ctx["cache_warm"]:
+            return
+        log(f"  filling the {cache['tool']} cache for {scenario} (untimed)")
+        clean()
+        r = run(base_cmd + ["build", "--workspace", "-j", str(jobs)], cwd=wsdir, env=env)
+        if r.returncode:
+            sys.exit(f"cache-filling build failed:\n{r.stderr[-2000:]}")
+        cache_stop(cache, env)
+        ctx["cache_warm"] = True
+
     timed_cmd: list[str]
     touched: str | None = None
     if scenario in ("cold-build", "deps-only"):
@@ -567,19 +894,52 @@ def one_run(ctx: dict, scenario: str, index: int) -> list[dict]:
         touched = ws["touch_leaf"] if scenario == "touch-leaf" else ws["touch_core"]
         touch(wsdir / touched, f"{scenario} run {index} {time.time():.0f}")
         timed_cmd = base_cmd + build
+    # Phase 2. Every cache scenario first stops the server or daemon a previous run left, so
+    # no timed run inherits one; populate() stops it again after filling the cache.
+    elif scenario == "cache-cold":
+        cache_stop(cache, env)
+        cache_wipe(cache)
+        ctx["cache_warm"] = False
+        clean()
+        timed_cmd = base_cmd + build
+    elif scenario in ("cache-hit", "cache-partial"):
+        cache_stop(cache, env)
+        populate()
+        if cache["tool"] == "kache" and cache["backend"] != "local":
+            # A fresh CI runner: kache's local store starts empty, so hits come from the remote.
+            cache_wipe(cache)
+        clean()
+        if scenario == "cache-partial":
+            touched = ws["touch_core"]
+            touch(wsdir / touched, f"{scenario} run {index} {time.time():.0f}")
+        timed_cmd = base_cmd + build
+    elif scenario == "cache-warm-local":
+        # The edit loop: the server or daemon the warm-up build starts stays up into the timed build.
+        cache_stop(cache, env)
+        populate()
+        warm()
+        touched = ws["touch_leaf"]
+        touch(wsdir / touched, f"{scenario} run {index} {time.time():.0f}")
+        timed_cmd = base_cmd + build
     else:
         sys.exit(f"unknown scenario {scenario}")
 
+    before = cache_before(cache, env) if cache else None
     started = time.time()
     log(f"  {scenario} run {index}: {' '.join(timed_cmd[1:])}")
     m = measure(timed_cmd, wsdir, env, raw / "cargo.log")
+    cache_stats, invalid = cache_after(cache, env, before) if cache else (None, None)
     if touched:
         restore(wsdir, touched)
     if m["exit"] != 0:
         log(f"  cargo exited {m['exit']}; see {raw / 'cargo.log'}")
         failed = base_record(ctx, scenario, index, m)
         failed.update({"error": f"cargo exited {m['exit']}", "log": str(raw / "cargo.log")})
+        if cache_stats is not None:
+            failed["cache_stats"] = cache_stats
         return [failed]
+    if scenario == "cache-cold" and not invalid:
+        ctx["cache_warm"] = True
 
     report = newest_timing_report(target, started)
     timing = parse_timing_report(report) if report else None
@@ -587,6 +947,10 @@ def one_run(ctx: dict, scenario: str, index: int) -> list[dict]:
         shutil.copy(report, raw / "cargo-timing.html")
     members = ctx["members"]
     record = base_record(ctx, scenario, index, m)
+    if cache_stats is not None:
+        record["cache_stats"] = cache_stats
+    if invalid:
+        record["error"] = invalid
     if timing:
         cls = classify_units(timing["units"], members)
         capacity = m["wall_s"] * jobs
@@ -615,6 +979,8 @@ def one_run(ctx: dict, scenario: str, index: int) -> list[dict]:
         }
         record["cpu_utilization"] = round((m["user_s"] + m["sys_s"]) / capacity, 4) if capacity else None
         record["timings_summary"] = timing["summary"]
+        if scenario in critical_path.COLD_SCENARIOS:
+            record["critical_path"] = critical_path.summary(timing["units"])
         # Both read the timed build's target dir, so they come before the profiled pass,
         # which cleans it and rebuilds with other flags.
         record["target_dir_mib"] = target_mib(target)
@@ -708,12 +1074,16 @@ def time_test_run(ctx: dict, base_cmd: list[str], env: dict[str, str], jobs: int
 
 def base_record(ctx: dict, scenario: str, index: int, m: dict) -> dict:
     ws = ctx["ws"]
+    cache = ctx["cache"]
     return {
         "schema": SCHEMA,
         "workspace": f"{ws['repo'].split('github.com/')[-1]}",
         "commit": ws["commit"],
         "scenario": scenario,
         "config": ctx["config"],
+        "cache": cache["tool"] if cache else "none",
+        "cache_backend": cache["backend"] if cache else "none",
+        "cache_version": cache["version"] if cache else None,
         "run": index,
         "recorded_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
         "toolchain": {**ctx["toolchain"], "linker": ctx["linker"]},
@@ -776,6 +1146,27 @@ def self_test() -> int:
     assert deps_finished_at([{"name": "dep", "start": 1.0, "duration": 2.0}, {"name": "app", "start": 3.0, "duration": 1.0}], {"app"}) == 3.0
     # 4 slots, 2 busy for the first 5 s, 4 busy for the last 5: 10 idle slot-seconds.
     assert idle_slot_seconds([{"t": 0.0, "active": 2}, {"t": 5.0, "active": 4}], 4, 10.0) == 10.0
+
+    # Phase 2: the baseline environment has no wrapper; a cache run sets it and turns
+    # incremental compilation off, and the variables that would skew it are gone.
+    base = {"RUSTC_WRAPPER": "sccache", "SCCACHE_RECACHE": "1", "PATH": "/bin"}
+    env = cargo_env(base, "baseline-stable", Path("/t"), None)
+    assert "RUSTC_WRAPPER" not in env and "CARGO_INCREMENTAL" not in env, env
+    cache = {"tool": "sccache", "path": "/opt/sccache", "env": {"SCCACHE_DIR": "/c"}, "unset": CACHE_UNSET["sccache"]}
+    env = cargo_env(base, "baseline-stable", Path("/t"), None, cache)
+    assert (env["RUSTC_WRAPPER"], env["CARGO_INCREMENTAL"], env["SCCACHE_DIR"]) == ("/opt/sccache", "0", "/c"), env
+    assert "SCCACHE_RECACHE" not in env, env
+    assert sccache_backend({"SCCACHE_BUCKET": "b"}) == "s3" and sccache_backend({}) == "local"
+    assert kache_backend({"KACHE_S3_BUCKET": "b"}) == "s3" and kache_backend({"KACHE_S3_BUCKET": "b", "KACHE_LOCAL_ONLY": "1"}) == "local"
+    info = {"stats": {"cache_hits": {"counts": {"Rust": 9}, "adv_counts": {}}, "cache_misses": {"counts": {"Rust": 1}, "adv_counts": {}},
+                      "cache_errors": {"counts": {}, "adv_counts": {}}, "cache_writes": 1, "requests_not_cacheable": 2,
+                      "cache_read_hit_duration": {"secs": 1, "nanos": 500000000}, "cache_write_duration": {"secs": 0, "nanos": 250000000}}}
+    st = sccache_stats(info)
+    assert (st["hits"], st["misses"], st["errors"], st["hit_rate"], st["read_s"], st["write_s"], st["not_cacheable"]) == (9, 1, 0, 0.9, 1.5, 0.25, 2), st
+    before = kache_totals({"summary": {"local_hits": 5, "misses": 10}, "timing": {"total_restore_ms": 100, "total_store_ms": 2000}})
+    after = kache_totals({"summary": {"local_hits": 13, "remote_hits": 1, "misses": 10, "dups": 1}, "timing": {"total_restore_ms": 1100, "total_store_ms": 2250}})
+    st = kache_stats(before, after)
+    assert (st["hits"], st["misses"], st["errors"], st["hit_rate"], st["read_s"], st["write_s"]) == (9, 1, 0, 0.9, 1.0, 0.25), st
     print("run.py self-test: ok")
     return 0
 
@@ -798,6 +1189,9 @@ def main() -> int:
     ap.add_argument("--raw", type=Path, default=HERE / "results" / "raw", help="where traces and logs go (git-ignored)")
     ap.add_argument("--online", action="store_true", help="let the timed cargo runs reach the network (default: --offline after one untimed `cargo fetch`)")
     ap.add_argument("--keep-traces", action="store_true", help="keep the binary self-profile traces (default: delete them once summarized)")
+    ap.add_argument("--cache", default="none", choices=CACHES,
+                    help="Phase 2: build through this cache, in an empty cache directory of the invocation's own; "
+                         "runs the cache-* scenarios, which need it (default: none)")
     ap.add_argument("--list", action="store_true", help="list workspaces, scenarios and configurations")
     ap.add_argument("--self-test", action="store_true", help="check the measurement path, size facts and share arithmetic, then exit")
     args = ap.parse_args()
@@ -808,14 +1202,26 @@ def main() -> int:
     if args.list or not args.workspace:
         print("workspaces:   " + ", ".join(ws["name"] for ws in corpus["workspace"]))
         print("scenarios:    " + ", ".join(SCENARIOS))
+        print("              " + ", ".join(CACHE_SCENARIOS) + " (Phase 2; these need --cache sccache or --cache kache)")
         print("configs:      " + ", ".join(f"{k}{'' if i < 2 else ' (Phase 1)'}" for i, k in enumerate(CONFIGS)))
+        print("caches:       " + ", ".join(CACHES) + " (--cache; default none)")
         return 0 if args.list else 2
 
     ws = workspace(corpus, args.workspace)
-    scenarios = list(SCENARIOS) if args.scenarios == "all" else args.scenarios.split(",")
+    cached = args.cache != "none"
+    if args.scenarios == "all":
+        scenarios = list(CACHE_SCENARIOS if cached else SCENARIOS)
+    else:
+        scenarios = args.scenarios.split(",")
     for s in scenarios:
-        if s not in SCENARIOS:
+        if s in CACHE_SCENARIOS and not cached:
+            sys.exit(f"scenario `{s}` builds through a cache; add --cache sccache or --cache kache")
+        if s in SCENARIOS and cached:
+            # One kind per invocation, so a record's `cache` field always says which kind it is.
+            sys.exit(f"--cache runs only the cache scenarios ({', '.join(CACHE_SCENARIOS)}); run `{s}` without --cache")
+        if s not in SCENARIOS and s not in CACHE_SCENARIOS:
             sys.exit(f"unknown scenario `{s}`; --list shows them")
+    cache = find_cache(args.cache)
     if "deps-only" in scenarios and "cold-build" in scenarios:
         scenarios.remove("cold-build")  # deps-only is derived from the same cold build
     jobs = args.jobs or os.cpu_count() or 1
@@ -849,28 +1255,54 @@ def main() -> int:
     machine = machine_info(jobs, args.label)
     results = args.results or HERE / "results" / f"{dt.date.today().isoformat()}-{machine['label']}.jsonl"
     results.parent.mkdir(parents=True, exist_ok=True)
-    raw = args.raw / ws["name"] / args.config
+    raw = args.raw / ws["name"] / (args.config if cache is None else f"{args.config}+{cache['tool']}")
     ctx = {
         "ws": ws, "wsdir": wsdir, "cargo": cargo, "config": args.config, "jobs": jobs, "env": env,
         "members": members, "toolchain": toolchain, "linker": linker_info(CONFIGS[args.config][1]),
         "machine": machine, "raw": raw, "offline": not args.online, "keep_traces": args.keep_traces,
-        "size_facts": facts,
+        "size_facts": facts, "cache": cache, "cache_warm": False,
     }
     log(f"{ws['name']} @ {ws['commit'][:8]} | {args.config} | {toolchain['rustc']} | -j {jobs} | {machine['cpu']}, {machine['cores']} cores, {machine['ram_gib']} GiB")
+    if cache is not None:
+        prepare_cache(cache, args.work, ws["name"])
+        log(f"cache: {cache['version']} ({cache['backend']}), local directory {cache['store']}")
+        if cache["backend"] != "local" and "cache-cold" in scenarios:
+            log(f"note: cache-cold empties only the local directory; the {cache['backend']} remote keeps what it holds "
+                "(use a fresh key prefix for a cold remote)")
     log(f"results -> {results}; raw -> {raw}")
-    with open(results, "a") as out:
-        for scenario in scenarios:
-            for i in range(1, args.runs + 1):
-                for rec in one_run(ctx, scenario, i):
-                    out.write(json.dumps(rec, sort_keys=True) + "\n")
-                    out.flush()
-                    if "error" in rec:
-                        log(f"  -> {rec['scenario']} run {i}: FAILED ({rec['error']})")
-                    else:
-                        sh = rec.get("share") or {}
-                        log(f"  -> {rec['scenario']} run {i}: wall {rec['wall_s']}s cpu {rec.get('user_s')}+{rec.get('sys_s')}s "
-                            f"peak {rec.get('peak_rss_mib')} MiB units {rec.get('units')} "
-                            f"deps {sh.get('deps')} pm {sh.get('proc_macro_build_rs')} idle {sh.get('idle')}")
+    try:
+        with open(results, "a") as out:
+            for scenario in scenarios:
+                for i in range(1, args.runs + 1):
+                    for rec in one_run(ctx, scenario, i):
+                        out.write(json.dumps(rec, sort_keys=True) + "\n")
+                        out.flush()
+                        if "error" in rec:
+                            log(f"  -> {rec['scenario']} run {i}: FAILED ({rec['error']})")
+                        else:
+                            sh = rec.get("share") or {}
+                            cs = rec.get("cache_stats") or {}
+                            log(f"  -> {rec['scenario']} run {i}: wall {rec['wall_s']}s cpu {rec.get('user_s')}+{rec.get('sys_s')}s "
+                                f"peak {rec.get('peak_rss_mib')} MiB units {rec.get('units')} "
+                                f"deps {sh.get('deps')} pm {sh.get('proc_macro_build_rs')} idle {sh.get('idle')}"
+                                + (f" hit rate {cs.get('hit_rate')}" if cs else ""))
+    except CacheStillRunning as e:
+        log(f"error: {e}")
+        return 1
+    finally:
+        if cache is not None and "root" in cache:
+            # The cache is this invocation's alone; nothing reuses it, and it runs to gigabytes.
+            # Keep it when its daemon may still be writing to it (CacheStillRunning).
+            if cache.get("still_running"):
+                log(f"  keeping the {cache['tool']} cache directory {cache['root']}: its daemon may still be running")
+            else:
+                try:
+                    cache_stop(cache, cargo_env(env, args.config, wsdir / "target", None, cache))
+                except CacheStillRunning as e:
+                    log(f"  {e}")
+                else:
+                    shutil.rmtree(cache["root"], ignore_errors=True)
+                    log(f"removed the {cache['tool']} cache directory {cache['root']}")
     return 0
 
 

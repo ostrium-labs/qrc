@@ -66,3 +66,20 @@ jobs:
           python3 bench/run.py --list
           python3 bench/run.py --self-test
           python3 bench/analyze.py --self-test
+          python3 bench/critical_path.py --self-test
+
+  shell:
+    name: Shell check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # shellcheck comes with the ubuntu-24.04 image (its readme lists it under apt packages).
+      - name: shellcheck version
+        run: shellcheck --version
+      - name: Every tracked shell script passes shellcheck
+        # bash (not the default shell) adds pipefail, so a git ls-files failure fails the step.
+        shell: bash
+        run: git ls-files -z '*.sh' | xargs -0 -r shellcheck

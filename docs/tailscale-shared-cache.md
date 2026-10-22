@@ -1,6 +1,8 @@
 # Tailscale shared build cache
 
-**Status:** plan, written 2026-10-22. Nothing here is built or measured yet.
+**Status:** plan, written 2026-10-22. The deployment files are in
+[deploy/shared-cache](../deploy/shared-cache/README.md). None of them has been run against a real
+tailnet or the loams CI yet, and nothing is measured.
 **Owner decision:** maintainers' laptops and the CI of `ostrium-labs/loams` share one build cache over
 Tailscale, and only maintainers can use it.
 
@@ -108,6 +110,8 @@ Notes:
 - Use `tests` in the ACL file to assert these rules (for example, that `tag:ci` cannot reach a
   laptop), so a later edit cannot widen them silently.
 - Have a second maintainer review every ACL change.
+- The version to merge, with its `tests`, is
+  [deploy/shared-cache/tailnet-policy.hujson](../deploy/shared-cache/tailnet-policy.hujson).
 
 ### 3.2 S3 credentials (the data layer)
 
@@ -156,7 +160,8 @@ Release, package and publish workflows (anything that produces an artefact we sh
 container images, installers) do **not** join the tailnet and do **not** set the cache env vars. They
 build from scratch. A poisoned cache entry therefore cannot reach a shipped artefact. Enforce it two
 ways: keep the cache steps out of those workflow files, and add a CI check that fails if a release
-workflow mentions the cache variables or the Tailscale action.
+workflow mentions the cache variables or the Tailscale action
+([check_release_workflows.py](../deploy/shared-cache/ci/check_release_workflows.py)).
 
 ### 3.6 Write paths and poisoning
 
@@ -175,17 +180,39 @@ read. How we limit that:
 
 The cache is a speed-up, never a dependency. If it is down, builds must compile locally and pass.
 
-- `SCCACHE_IGNORE_SERVER_IO_ERROR=1`: sccache falls back to compiling when the store errors.
-  If kache wins the benchmark, use its equivalent setting.
-- **Timeouts:** keep connect and request timeouts short so an unreachable store costs seconds, not
-  minutes. Also put a time limit on the "join tailnet" step, and make it non-fatal
-  (`continue-on-error`) so a Tailscale outage does not fail the job.
-- **Size and eviction:** set a quota on the bucket and a lifecycle rule that deletes entries not used
-  for a set time (start with 30 days, tune from the measurements). Watch the disk on the store box.
-- **Cross-machine hits:** keys only match if the inputs match. So:
+- `SCCACHE_IGNORE_SERVER_IO_ERROR=1`: once the sccache server is running, a store that errors or
+  disappears does not fail the build: a lookup that fails counts as a miss and compiles locally.
+  It does not cover a store that cannot be reached when the sccache server starts. In sccache
+  v0.18.0 the server then does not start, and every compile through the wrapper fails
+  ([src/server.rs](https://github.com/mozilla/sccache/blob/v0.18.0/src/server.rs), `start_server`). So the wrapper is turned on only after a
+  check: the CI step probes the store's `/health` and starts the sccache server before it sets
+  `RUSTC_WRAPPER`, and keeps that server up for the whole job. The laptop settings probe `/health`
+  too. If kache wins the benchmark, use its equivalent settings.
+- **Timeouts:** sccache v0.18.0 has no setting for S3 connect or request timeouts. What a dead store
+  costs is bounded instead by the probe (`curl --max-time 3`, and sccache waits at most 10 seconds
+  for its server to start, [src/commands.rs](https://github.com/mozilla/sccache/blob/v0.18.0/src/commands.rs)) and, if the store disappears
+  during a job, by sccache's limit of 60 seconds per cache lookup
+  ([src/compiler/compiler.rs](https://github.com/mozilla/sccache/blob/v0.18.0/src/compiler/compiler.rs)). With a read-write key, the cache write
+  after each miss has no such limit, so a laptop can be slowed down more than CI. Also put a time
+  limit on the "join tailnet" step, and make it non-fatal (`continue-on-error`) so a Tailscale
+  outage does not fail the job.
+- **Size and eviction:** set a quota on the bucket and a lifecycle rule that deletes entries older
+  than a set age (start with 30 days, tune from the measurements). S3 lifecycle expiry counts from
+  when an object was written, and sccache's reads do not refresh it, so an entry that is still in
+  use is also deleted at that age and written again on its next miss. Watch the disk on the store
+  box.
+- **Cross-machine hits:** keys only match if the inputs match, and for Rust the inputs include
+  absolute paths. sccache v0.18.0 hashes the compile's working directory, the full rustc argument
+  list and the `CARGO_*` variables as they are ([src/compiler/rust.rs](https://github.com/mozilla/sccache/blob/v0.18.0/src/compiler/rust.rs)),
+  and its [README](https://github.com/mozilla/sccache/blob/v0.18.0/README.md) says absolute paths must match for a hit. Its `SCCACHE_BASEDIRS`
+  setting strips paths, but `src/compiler/rust.rs` does not use it in that version. So:
   - pin the toolchain with `rust-toolchain.toml`, and use the same version on laptops and CI;
-  - pass `--remap-path-prefix` (for example, map the workspace root to `/workspace` and `$HOME/.cargo`
-    to `/cargo`) so absolute paths do not differ per machine;
+  - use the same `RUSTFLAGS` on every machine that should share entries, since they are part of the
+    key. `--remap-path-prefix` (for example, map the workspace root to `/workspace` and
+    `$HOME/.cargo` to `/cargo`) makes paths in the build output the same on every machine, but it
+    does not make keys match, because the flag itself names the local path;
+  - expect hits only between machines with the same checkout path and the same `CARGO_HOME` path.
+    loams' GitHub-hosted runners share these with each other; laptops mostly do not;
   - keep incremental compilation off where the cache is used;
   - note that the OS and CPU architecture must match too, so Linux laptops share with the Linux CI,
     and a macOS laptop mostly shares only with other macOS laptops.
@@ -220,6 +247,9 @@ If the gain is small, stop and say so.
 
 Steps marked **(owner)** need the Tailscale admin console or repository secrets. Only the owner does
 those. Nobody should send keys or secrets in an issue, a pull request or chat.
+
+The files and commands for every step, and who runs each, are in
+[deploy/shared-cache/README.md](../deploy/shared-cache/README.md).
 
 ### 6.1 Server
 
@@ -258,32 +288,39 @@ those. Nobody should send keys or secrets in an issue, a pull request or chat.
 
 ### 6.4 Client env vars (maintainer laptops)
 
-Put these in your shell profile or `~/.cargo/config.toml` env section on your own machine. The values
-in angle brackets are placeholders, and the keys come from the owner over a private channel the owner
-chooses, never an issue.
+The full, commented file is
+[deploy/shared-cache/client/sccache.env.example](../deploy/shared-cache/client/sccache.env.example).
+Source it from your shell profile, or from a direnv `.envrc` in your loams checkout. The values in
+angle brackets are placeholders, and the key file comes from the owner over a private channel the
+owner chooses, never an issue.
 
 ```sh
-export RUSTC_WRAPPER=sccache
 export SCCACHE_BUCKET=rust-cache
-export SCCACHE_ENDPOINT=http://<build-cache-tailnet-name>:9000
-export SCCACHE_REGION=us-east-1            # any value the store accepts
-export SCCACHE_S3_USE_PATH_STYLE=true      # required by most self-hosted stores
+export SCCACHE_ENDPOINT="http://<build-cache-tailnet-name>:9000"
+export SCCACHE_REGION=us-east-1            # the store's RUSTFS_REGION
 export SCCACHE_S3_USE_SSL=false            # plain HTTP, but inside the encrypted tailnet
-export SCCACHE_S3_KEY_PREFIX=<toolchain>/<target>
+export SCCACHE_S3_KEY_PREFIX="<rustc release>/<host target>"
 export SCCACHE_IGNORE_SERVER_IO_ERROR=1
-export AWS_ACCESS_KEY_ID=<maintainer-rw key id>
-export AWS_SECRET_ACCESS_KEY=<maintainer-rw secret>
 export CARGO_INCREMENTAL=0
-export RUSTFLAGS="--remap-path-prefix=$PWD=/workspace --remap-path-prefix=$HOME/.cargo=/cargo"
+export RUSTFLAGS="--remap-path-prefix=<path to your loams checkout>=/workspace --remap-path-prefix=$HOME/.cargo=/cargo"
+set -a; . "<path to your maintainer-<name>.env key file>"; set +a   # AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+# The wrapper only when the store answers (section 4):
+if curl -fsS --max-time 2 -o /dev/null "$SCCACHE_ENDPOINT/health"; then export RUSTC_WRAPPER=sccache; fi
 ```
 
-Check the exact variable names against the sccache version we pin, because they change between
-releases.
+There is no `SCCACHE_S3_USE_PATH_STYLE` setting: path-style addressing, which RustFS serves, is
+sccache's default, and virtual-host style is opt-in through `SCCACHE_S3_ENABLE_VIRTUAL_HOST_STYLE`,
+which we leave unset. `RUSTFLAGS` names your checkout path explicitly, because `$PWD` in a shell
+profile is wherever the shell started. The names were checked against sccache v0.18.0
+([docs/S3.md](https://github.com/mozilla/sccache/blob/v0.18.0/docs/S3.md)); check them again when the pinned version changes.
 
 ### 6.5 CI workflow snippet
 
-This goes in loams' build and test workflow only, never in a release workflow. Actions are pinned by
-SHA (the comment shows the release each SHA was taken from).
+This goes in loams' build and test workflow only, never in a release workflow. The full, commented
+file is [deploy/shared-cache/ci/loams-cache-steps.yml](../deploy/shared-cache/ci/loams-cache-steps.yml);
+if the two differ, the file is right. Actions are pinned by SHA (the comment shows the release each
+SHA was taken from), and only to releases at least 14 days old: `tailscale/github-action` v4.3.0 came
+out on 2026-10-22, so v4.2.0 (2026-09-22) is pinned.
 
 ```yaml
 on:
@@ -296,51 +333,77 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
-      HAS_CACHE_SECRETS: ${{ secrets.TS_OAUTH_SECRET != '' }}
+      HAS_CACHE_SECRETS: ${{ secrets.TS_OAUTH_SECRET != '' && secrets.SCCACHE_CI_RO_SECRET != '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # Skipped on fork PRs, because GitHub gives them no secrets.
       - name: Join the tailnet
+        id: tailnet
         if: env.HAS_CACHE_SECRETS == 'true'
         continue-on-error: true
         timeout-minutes: 2
-        uses: tailscale/github-action@99a8333667fff04fdd6cffb46dfd409f8329a7bf # v4.3.0
+        uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd # v4.2.0
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
           tags: tag:ci
           # The action registers ephemeral nodes for OAuth clients.
 
-      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - name: Install sccache
+        id: sccache
+        if: env.HAS_CACHE_SECRETS == 'true' && steps.tailnet.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.18.0
+          disable_annotations: true   # its post step would fail the job if the store went away
 
-      - name: Turn on the shared cache
-        if: env.HAS_CACHE_SECRETS == 'true'
+      # On only if the store answers and the sccache server starts (section 4).
+      - name: Turn on the shared cache if the store answers
+        if: env.HAS_CACHE_SECRETS == 'true' && steps.tailnet.outcome == 'success' && steps.sccache.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 5
+        env:
+          SCCACHE_BUCKET: rust-cache
+          SCCACHE_ENDPOINT: http://<build-cache-tailnet-name>:9000
+          SCCACHE_REGION: us-east-1
+          SCCACHE_S3_USE_SSL: 'false'
+          SCCACHE_S3_RW_MODE: READ_ONLY      # the ci-ro key; sccache does not try to write
+          SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
+          SCCACHE_IDLE_TIMEOUT: '0'          # keep the server up for the whole job
+          AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_CI_RO_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_CI_RO_SECRET }}
         run: |
-          {
-            echo "RUSTC_WRAPPER=sccache"
-            echo "SCCACHE_BUCKET=rust-cache"
-            echo "SCCACHE_ENDPOINT=http://<build-cache-tailnet-name>:9000"
-            echo "SCCACHE_REGION=us-east-1"
-            echo "SCCACHE_S3_USE_PATH_STYLE=true"
-            echo "SCCACHE_S3_USE_SSL=false"
-            echo "SCCACHE_IGNORE_SERVER_IO_ERROR=1"
-            echo "AWS_ACCESS_KEY_ID=${{ secrets.SCCACHE_CI_RO_KEY_ID }}"
-            echo "AWS_SECRET_ACCESS_KEY=${{ secrets.SCCACHE_CI_RO_SECRET }}"
-            echo "CARGO_INCREMENTAL=0"
-          } >> "$GITHUB_ENV"
+          curl -fsS --max-time 3 -o /dev/null "$SCCACHE_ENDPOINT/health" || exit 0
+          release="$(rustc -vV | sed -n 's/^release: //p')"
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          export SCCACHE_S3_KEY_PREFIX="$release/$host"
+          sccache --start-server || exit 0
+          for name in SCCACHE_BUCKET SCCACHE_ENDPOINT SCCACHE_REGION SCCACHE_S3_USE_SSL \
+                      SCCACHE_S3_RW_MODE SCCACHE_IGNORE_SERVER_IO_ERROR SCCACHE_IDLE_TIMEOUT \
+                      SCCACHE_S3_KEY_PREFIX AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
+            printf '%s=%s\n' "$name" "${!name}"
+          done >> "$GITHUB_ENV"
+          printf '%s\n' RUSTC_WRAPPER=sccache CARGO_INCREMENTAL=0 SHARED_CACHE=on >> "$GITHUB_ENV"
 
-      - run: cargo nextest run --workspace
-      - if: always() && env.HAS_CACHE_SECRETS == 'true'
+      - run: cargo nextest run --workspace --locked
+      - name: Shared cache stats
+        if: always() && env.HAS_CACHE_SECRETS == 'true' && env.SHARED_CACHE == 'on'
+        continue-on-error: true
         run: sccache --show-stats
 ```
 
 If the secret is empty (a fork), the cache steps are skipped and the build runs as it does today.
-Keep the secret-presence check on every cache step. Re-check each SHA against its upstream release
-before merging, and let Dependabot or Renovate keep them current.
+If the store does not answer, the cache stays off and the build runs as it does today. Keep the
+secret-presence check on every cache step. Re-check each SHA against its upstream release before
+merging, and let Dependabot or Renovate keep them current.
 
 ### 6.6 Rollback
 
@@ -358,5 +421,9 @@ The cache is additive, so rollback is simple and fast:
 
 - sccache or kache: decided by the Phase 2 benchmark.
 - Does CI write on `dev` pushes (the `ci-rw` key), or do only laptops write? Decide after the first
-  read-only measurements.
+  read-only measurements. Because cache keys contain absolute paths (section 4), CI may get few hits
+  from laptop writes, while runners would share entries with each other. That makes `ci-rw` more
+  likely to be needed than this plan first assumed.
+- Do laptops keep `--remap-path-prefix`? It does not make keys match across machines, and while CI
+  sets no `RUSTFLAGS`, it also keeps laptop entries from matching CI's.
 - Which box hosts the store, and who is on call for it.

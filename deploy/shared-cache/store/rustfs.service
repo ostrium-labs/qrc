@@ -1,0 +1,27 @@
+# /etc/systemd/system/rustfs.service on the store box (tag:build-cache).
+# Install: the rustfs binary as /usr/local/bin/rustfs (a release at least 14 days old,
+# checked against its published sha256), wait-for-address.sh as
+# /usr/local/lib/qrc-cache/wait-for-address.sh, and a system user `rustfs` that owns
+# /srv/rustfs. Then: systemctl daemon-reload && systemctl enable --now rustfs
+[Unit]
+Description=RustFS, the S3 store of the qrc shared build cache
+After=network-online.target tailscaled.service
+Wants=network-online.target tailscaled.service
+
+[Service]
+User=rustfs
+Group=rustfs
+EnvironmentFile=/etc/rustfs/rustfs.env
+ExecStartPre=/usr/local/lib/qrc-cache/wait-for-address.sh
+ExecStart=/usr/local/bin/rustfs server
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/srv/rustfs
+
+[Install]
+WantedBy=multi-user.target

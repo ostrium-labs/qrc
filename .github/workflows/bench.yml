@@ -1,0 +1,210 @@
+name: Bench
+
+# Runs the Phase 0 harness (bench/run.py, docs/phase-0.md) on a GitHub-hosted Linux runner, for
+# one corpus workspace under one configuration. It only runs when started by hand: the large
+# workspaces cannot be measured on the maintainers' laptops. How to start it and how to commit
+# its results: "Running the harness in CI" in bench/README.md.
+#
+# A standard runner for a public repository has 4 vCPUs, 16 GB of RAM and 14 GB of SSD storage
+# (https://docs.github.com/en/actions/reference/runners/github-hosted-runners). Hence -j 4 by
+# default, and a step that deletes preinstalled toolchains the harness does not use before
+# anything is built. zed and loams budget 40 GB and 30 GB of disk for a debug build (the notes
+# in bench/corpus.toml) and may need a larger runner: pass its label as `runner`.
+
+on:
+  workflow_dispatch:
+    inputs:
+      workspace:
+        description: Corpus workspace (bench/corpus.toml)
+        type: choice
+        options: [loams, ripgrep, nushell, zed]
+        required: true
+      config:
+        description: Configuration
+        type: choice
+        options: [baseline-stable, baseline-nightly]
+        default: baseline-stable
+        required: true
+      runs:
+        description: Runs per scenario
+        type: string
+        default: "5"
+      jobs:
+        description: cargo -j
+        type: string
+        default: "4"
+      scenarios:
+        description: Comma-separated scenarios, or all
+        type: string
+        default: all
+      runner:
+        description: Runner label (a larger runner's label for zed or loams)
+        type: string
+        default: ubuntu-24.04
+      label:
+        description: Machine label recorded in the results (empty means gha-<runner>)
+        type: string
+        default: ""
+
+run-name: Bench ${{ inputs.workspace }} ${{ inputs.config }} on ${{ inputs.runner }}
+
+permissions:
+  contents: read
+
+concurrency:
+  # One run per workspace and configuration at a time. A second dispatch waits rather than
+  # cancelling a run that may be hours in.
+  group: bench-${{ inputs.workspace }}-${{ inputs.config }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  bench:
+    name: ${{ inputs.workspace }} ${{ inputs.config }}
+    runs-on: ${{ inputs.runner }}
+    # GitHub-hosted jobs are stopped after 6 hours
+    # (https://docs.github.com/en/actions/reference/limits). The harness step stops at 300
+    # minutes and the job at 330, so the report and the upload still run.
+    timeout-minutes: 330
+    env:
+      # The inputs reach the scripts only through the environment, and are quoted there. No
+      # script interpolates an input expression directly (script injection).
+      WS: ${{ inputs.workspace }}
+      CONFIG: ${{ inputs.config }}
+      RUNS: ${{ inputs.runs }}
+      JOBS: ${{ inputs.jobs }}
+      SCENARIOS: ${{ inputs.scenarios }}
+      RUNNER_INPUT: ${{ inputs.runner }}
+      LABEL_INPUT: ${{ inputs.label }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The next steps run code from the checked-out revision; the token is not needed.
+          persist-credentials: false
+
+      - name: Check the inputs
+        id: params
+        run: |
+          [[ "$RUNS" =~ ^[1-9][0-9]*$ ]] || { echo "::error::runs must be a positive integer"; exit 1; }
+          [[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || { echo "::error::jobs must be a positive integer"; exit 1; }
+          [[ "$SCENARIOS" =~ ^[a-z,-]+$ ]] || { echo "::error::scenarios must be comma-separated names, or all"; exit 1; }
+          # The label names the results file and is recorded in every result, so it is reduced
+          # to letters, digits, dots, underscores and hyphens.
+          label="${LABEL_INPUT:-gha-$RUNNER_INPUT}"
+          label="$(printf '%s' "$label" | tr -c 'A-Za-z0-9._-' '-')"
+          # One results file per date and machine, as the plan names it (docs/phase-0.md §4).
+          results="$RUNNER_TEMP/results/$(date -u +%Y-%m-%d)-$label.jsonl"
+          echo "label=$label" >> "$GITHUB_OUTPUT"
+          echo "results=$results" >> "$GITHUB_OUTPUT"
+          echo "label $label, results $results"
+
+      - name: Report the machine and free disk
+        run: |
+          nproc
+          free -h
+          df -h
+          # Preinstalled toolchains the harness does not use. A path the image lacks is skipped.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          if command -v docker >/dev/null; then
+            sudo docker image prune --all --force | tail -n 1 || echo "docker image prune failed; continuing"
+          fi
+          df -h
+
+      - name: Install the workspace's system libraries (bench/corpus.toml)
+        run: |
+          # tomllib needs Python 3.11 or newer; the runner image has 3.12.
+          libs="$(python3 - "$WS" <<'PY'
+          import sys
+          import tomllib
+
+          with open("bench/corpus.toml", "rb") as f:
+              corpus = tomllib.load(f)
+          for ws in corpus["workspace"]:
+              if ws["name"] == sys.argv[1]:
+                  print("\n".join(ws.get("system_libs", [])))
+                  break
+          else:
+              sys.exit(f"no workspace {sys.argv[1]!r} in bench/corpus.toml")
+          PY
+          )"
+          pkgs=()
+          if [ -n "$libs" ]; then
+            mapfile -t pkgs <<< "$libs"
+          fi
+          # zed's script/linux adds one package per release on top of system_libs (the notes in
+          # bench/corpus.toml); on Ubuntu 24.04 it is libstdc++-14-dev.
+          if [ "$WS" = zed ] && grep -q '^VERSION_ID="24.04"' /etc/os-release; then
+            pkgs+=(libstdc++-14-dev)
+          fi
+          if [ "${#pkgs[@]}" -eq 0 ]; then
+            echo "$WS needs no system libraries"
+            exit 0
+          fi
+          echo "installing ${pkgs[*]}"
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${pkgs[@]}"
+
+      - name: Rustup
+        run: |
+          # GitHub's runner images ship rustup; a larger runner on another image may not. The
+          # harness installs each workspace's pinned toolchain itself.
+          if ! command -v rustup >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup --version
+          cargo --version
+
+      - name: measureme's summarize (baseline-nightly)
+        if: inputs.config == 'baseline-nightly'
+        run: cargo install --locked --git https://github.com/rust-lang/measureme --tag 12.0.3 summarize
+
+      - name: Run the harness
+        timeout-minutes: 300
+        env:
+          LABEL: ${{ steps.params.outputs.label }}
+          RESULTS: ${{ steps.params.outputs.results }}
+        run: |
+          # --work must be on disk and not under /tmp (docs/phase-0.md §6); RUNNER_TEMP is on the
+          # runner's disk. Each run is appended to the results file as it finishes, so a run cut
+          # short by the timeout keeps the runs before it.
+          python3 bench/run.py "$WS" --work="$RUNNER_TEMP/qrc-bench" --config="$CONFIG" \
+            --runs="$RUNS" --jobs="$JOBS" --scenarios="$SCENARIOS" --label="$LABEL" --results="$RESULTS"
+
+      - name: Report
+        if: always() && steps.params.outcome == 'success'
+        env:
+          LABEL: ${{ steps.params.outputs.label }}
+          RESULTS: ${{ steps.params.outputs.results }}
+        run: |
+          out="$RUNNER_TEMP/results"
+          mkdir -p "$out"
+          {
+            echo "## Bench: $WS, $CONFIG"
+            echo
+            echo "Runner \`$RUNNER_INPUT\`, label \`$LABEL\`, $RUNS runs per scenario, -j $JOBS, scenarios \`$SCENARIOS\`."
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+          # cargo's timing reports and logs, copied beside the results so the artifact has one root.
+          if [ -d bench/results/raw ]; then
+            (cd bench/results && find raw \( -name cargo-timing.html -o -name '*.log' \) -exec cp --parents {} "$out/" \;)
+          fi
+          if [ ! -s "$RESULTS" ]; then
+            echo "No results were recorded; see the log of the harness step." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          python3 bench/analyze.py --out "$out/report.md" "$RESULTS"
+          cat "$out/report.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bench-${{ inputs.workspace }}-${{ inputs.config }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/results/
+          if-no-files-found: warn
+          retention-days: 30
