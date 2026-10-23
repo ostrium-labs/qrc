@@ -18,7 +18,7 @@ to validate.
 - Phase 0 plan: [docs/phase-0.md](docs/phase-0.md)
 - Shared build cache over Tailscale (plan): [docs/tailscale-shared-cache.md](docs/tailscale-shared-cache.md)
 - Layer 3 plan, `qrcd` and the opt-in loams-build research track (planned, not built): [docs/layer-3-scheduler.md](docs/layer-3-scheduler.md)
-- Build engine fork (research, planned): [ostrium-labs/loams-build](https://github.com/ostrium-labs/loams-build)
+- Build engine fork, main goal first-class TypeScript support in Buck2 (research, planned, not built): [ostrium-labs/loams-build](https://github.com/ostrium-labs/loams-build)
 
 ## The two-lane principle
 
