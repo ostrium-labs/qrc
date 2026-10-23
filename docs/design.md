@@ -110,7 +110,12 @@ Goal: a cold CI runner downloads prebuilt artifacts instead of compiling. Use an
 
 ## 6. Layer 3: orchestrator daemon `qrcd` (weeks to months)
 
-- Consumes cargo's unit graph (`cargo build --unit-graph`, a nightly flag) and schedules units itself.
+The detailed plan is in [layer-3-scheduler.md](layer-3-scheduler.md) (planned, not built). Decision
+(owner, 2026-10-23): `qrcd` is Rust only. A separate, opt-in research track, **loams-build**, would fork
+Buck2 and replace Cargo as the build driver; it is gated on the Layer 1 and 2 results, and plain Cargo
+stays supported. `qrcd` itself keeps Cargo as the driver.
+
+- Consumes cargo's unit graph (`cargo +nightly build --unit-graph -Zunstable-options`, a nightly flag) and schedules units itself.
 - **Cache-aware scheduling:** query the cache for hits before spawning rustc, so cached units never occupy a job slot. Wrapper-only caches cannot do this.
 - **Pipelining:** start dependents as soon as `.rmeta` exists, not when the full `.rlib` finishes.
 - **Smarter scheduling:** prioritize the critical path (longest chain first), be memory-aware, use one shared jobserver.
@@ -156,13 +161,13 @@ Unwinding and `should_panic` tests, inline asm, some SIMD intrinsics (cg_clif su
 | Component | Language | Why |
 |---|---|---|
 | rustc driver and codegen shim | **Rust** | Must link `rustc_private` (nightly, unstable) |
-| `qrcd`, hashing | **Zig** (or Rust) | Zig 0.16 `std.Io` gives clean parallel file I/O and hashing via `io.async`; `Io.Threaded` is enough (the release notes call it feature-complete and well-tested, while `Io.Evented` is work-in-progress and experimental) [S8] |
+| `qrcd`, hashing | **Rust** (decided 2026-10-23) | One language and toolchain with the driver; direct reuse of crates such as `jobserver` and `notify`; and loams-build, if built, forks Buck2, which is Rust. Zig was the alternative; the Zig notes below are kept for the backend question [S8] |
 | Backend core (if built) | **Zig** or **Rust** | Single-pass emitters are straightforward in either; Zig arenas fit compiler memory patterns |
 
 Notes
 - Zig 0.16 shipped in April 2026 (14 April) with large API breakage: all I/O now takes an `Io` instance [S8, S9]. Pin the toolchain version.
 - A Zig core called from a Rust shim over a C ABI is workable. Keep the interface a compact serialized IR, not the full `rustc_codegen_ssa` trait surface.
-- If you want one language and one toolchain, writing everything in Rust is the lower-friction path. Zig wins mainly on the build speed of the tool itself and on allocator control.
+- If you want one language and one toolchain, writing everything in Rust is the lower-friction path. Zig wins mainly on the build speed of the tool itself and on allocator control. That is why `qrcd` is Rust; the backend choice is still open.
 
 ## 10. Correctness strategy
 
@@ -223,7 +228,7 @@ qrc/
   docs/            this design, benchmarks
   bench/           corpus + harness (scripts, results)
   driver/          Rust: rustc_driver shim, codegen plug-in
-  qrcd/            Zig or Rust: orchestrator + cache client
+  qrcd/            Rust: orchestrator + cache client
   backend/         optional: single-pass emitter
   tests/           differential + determinism suites
 ```
@@ -233,7 +238,7 @@ qrc/
 1. Pick 3 to 5 real workspaces and run `cargo build --timings` plus `-Zself-profile` ([phase-0.md](phase-0.md)).
 2. Apply the Layer 1 bundle and record the deltas.
 3. Benchmark kache against sccache and set up the dependency layer on one CI pipeline.
-4. Decide Zig or Rust for `qrcd` after the cache benchmark shows the I/O shape.
+4. ~~Decide Zig or Rust for `qrcd`~~ Decided 2026-10-23: Rust ([layer-3-scheduler.md](layer-3-scheduler.md)). Whether to start the opt-in loams-build track waits on the results of steps 1 to 3.
 
 ## Fact-check notes
 
