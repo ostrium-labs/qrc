@@ -3,6 +3,8 @@
 **Status: planned, not built.** Nothing in this document exists yet. Every number below is either a
 measurement with a link to its source, or is labelled a target. Updated 2026-10-23.
 
+**Engine fork:** [ostrium-labs/loams-build](https://github.com/ostrium-labs/loams-build) (upstream-first fork of Buck2; research, planned, not built).
+
 **Owner decision (2026-10-23):** go with **loams-build**, a fork of [Buck2](https://github.com/facebook/buck2)
 adapted for Rust and TypeScript monorepos, written in Rust.
 
